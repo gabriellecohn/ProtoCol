@@ -1,0 +1,21 @@
+seed: 13
+device: cuda
+output_dir: outputs/synthetic_medium
+data:
+  manifest_path: data/interim/manifests/synthetic_medium_manifest.csv
+  pair_path: data/processed/stage_a/synthetic_medium_pairs.csv
+  sequence_column: sequence_1024
+  negatives_per_query: 15
+model:
+  config_path: configs/model/hash_dna_synthetic_medium.yaml
+training:
+  epochs: 3
+  batch_size: 4
+  grad_accum_steps: 4
+  learning_rate: 5.0e-4
+  weight_decay: 0.0
+  num_workers: 0
+  bf16: false
+  max_grad_norm: 1.0
+  eval_every_steps: 100
+  save_name: synthetic_medium_stage_a_best.pt

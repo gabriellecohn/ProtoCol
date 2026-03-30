@@ -1,0 +1,16 @@
+seed: 13
+device: cuda
+data:
+  manifest_path: data/interim/manifests/synthetic_medium_manifest.csv
+  pair_path: data/processed/stage_a/synthetic_medium_pairs.csv
+  sequence_column: sequence_1024
+evaluation:
+  top_k:
+    - 1
+    - 5
+    - 10
+    - 25
+  random_seed: 13
+  kmer_size: 6
+  sample_queries: 128
+  sample_corpus: 512
