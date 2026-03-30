@@ -1,0 +1,12 @@
+model_type: colbert
+model_name: hash-dna-debug
+max_length: 256
+projection_dim: 32
+score_temperature: 0.1
+gradient_checkpointing: false
+use_lora: false
+lora_rank: 0
+lora_alpha: 0
+lora_dropout: 0.0
+trust_remote_code: false
+

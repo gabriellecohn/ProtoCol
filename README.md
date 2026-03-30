@@ -1,3 +1,23 @@
+# DNA ColBERT MVP Branch
+
+This branch now includes an in-progress cCRE retrieval pipeline for the MVP
+described in [MVP_SPEC.md](MVP_SPEC.md). The new code lives alongside the
+existing diffusion project so the older work is still intact.
+
+Current retrieval entrypoints:
+
+```bash
+python -m src.data.parse_screen
+python -m src.data.extract_sequences --window 1024
+python -m src.data.split_by_chromosome
+python -m src.data.build_stage_a_pairs
+python -m src.train.train_stage_a --config configs/train/stage_a.yaml
+python -m src.eval.eval_screen --config configs/train/eval.yaml --baseline kmer
+```
+
+The full migration to the target `dna-colbert-mvp/` repo layout is still in
+progress.
+
 # CN-Aware Diffusion Regulatory Model
 
 A research model that discovers how somatic copy number alterations (CNAs) reshape distal regulatory interactions to modulate gene expression in cancer. The model uses a diffusion process over regulatory attention maps, conditioned on DNA sequence (via frozen Borzoi embeddings), copy number context, and observed expression.

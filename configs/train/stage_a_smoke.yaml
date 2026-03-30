@@ -1,0 +1,22 @@
+seed: 13
+device: cpu
+output_dir: outputs/smoke
+data:
+  manifest_path: data/interim/manifests/smoke_manifest.csv
+  pair_path: data/processed/stage_a/smoke_pairs.csv
+  sequence_column: sequence_512
+  negatives_per_query: 6
+model:
+  config_path: configs/model/hash_dna_smoke.yaml
+training:
+  epochs: 1
+  batch_size: 4
+  grad_accum_steps: 1
+  learning_rate: 0.001
+  weight_decay: 0.0
+  num_workers: 0
+  bf16: false
+  max_grad_norm: 1.0
+  eval_every_steps: 10
+  save_name: smoke_stage_a_best.pt
+

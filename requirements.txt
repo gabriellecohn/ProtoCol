@@ -9,3 +9,6 @@ pyranges>=0.0.129
 tqdm>=4.65.0
 matplotlib>=3.7.0
 seaborn>=0.12.0
+PyYAML>=6.0.1
+transformers>=4.39.0
+peft>=0.10.0

@@ -1,0 +1,16 @@
+seed: 13
+device: cpu
+data:
+  manifest_path: data/interim/manifests/smoke_manifest.csv
+  pair_path: data/processed/stage_a/smoke_pairs.csv
+  sequence_column: sequence_512
+evaluation:
+  top_k:
+    - 1
+    - 3
+    - 5
+  random_seed: 13
+  kmer_size: 5
+  sample_queries: 100
+  sample_corpus: 100
+

@@ -1,0 +1,12 @@
+model_type: colbert
+model_name: zhihan1996/DNABERT-2-117M
+max_length: 1024
+projection_dim: 64
+score_temperature: 0.02
+gradient_checkpointing: true
+use_lora: true
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.1
+trust_remote_code: true
+

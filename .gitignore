@@ -10,9 +10,12 @@ build/
 .venv/
 venv/
 data/
+!src/data/
+!src/data/*.py
 cache/
 checkpoints/
 results/
+outputs/
 *.h5
 *.pt
 *.fa
