@@ -11,7 +11,7 @@ model:
 training:
   epochs: 10
   batch_size: 20
-  grad_accum_steps: 1
+  grad_accum_steps: 4
   gpu_ids: [0, 1]
   learning_rate: 1.0e-4
   weight_decay: 0.01

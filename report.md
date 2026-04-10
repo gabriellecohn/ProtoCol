@@ -225,16 +225,18 @@ This keeps the GPU busy on a single large matrix operation with no Python-loop o
 |-----------|------------|-------------|
 | Epochs | 5 | 10 |
 | Batch size | 16 | 20 |
-| Gradient accumulation | 1 | 1 |
+| Gradient accumulation | 1 | 4 |
 | Learning rate | 1e-4 | 1e-4 |
 | Weight decay | 0.01 | 0.01 |
 | Max grad norm | 1.0 | 1.0 |
 | Negatives per query | 6 | 6 |
-| Temperature | 0.05 | 0.05 |
+| Temperature | 0.05 | 0.1 |
 | GPUs | 2x RTX 2080 Ti | 2x RTX 2080 Ti |
 | Precision | FP32 | FP32 |
 
 The DNABERT-2 backbone is wrapped in `DataParallel` across two GPUs, splitting the token encoding batch while keeping scoring and loss computation on the primary device.
+
+**Gradient accumulation.** With `grad_accum_steps=4`, weight updates are computed from the averaged gradients of 4 consecutive batches rather than a single batch. Each forward-backward pass processes 20 queries against 140 documents, but the optimizer only steps after accumulating gradients from 80 queries total. This stabilizes optimization: each weight update reflects a broader sample of the training distribution, reducing the noise from any single batch's random negative composition. In contrastive learning, where the learning signal depends entirely on which negatives happen to appear in the batch, this noise reduction is critical — without it, successive updates can push the model in conflicting directions, causing the loss to plateau at the random baseline (see Section 4.7).
 
 ### 4.7 Training Dynamics
 

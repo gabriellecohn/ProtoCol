@@ -64,6 +64,7 @@ def evaluate_model(model: torch.nn.Module, loader: DataLoader, temperature: floa
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train Stage A retrieval model")
     parser.add_argument("--config", default="configs/train/stage_a.yaml")
+    parser.add_argument("--resume", default=None, help="Path to checkpoint to resume training from")
     args = parser.parse_args()
 
     train_cfg, model_cfg = load_training_bundle(args.config)
@@ -132,16 +133,30 @@ def main() -> None:
     autocast_dtype = torch.bfloat16 if scaler_enabled else torch.float32
     temperature = float(model_cfg.get("score_temperature", 0.02))
     best_mrr = float("-inf")
+    start_epoch = 0
     output_dir = Path(train_cfg.get("output_dir", "outputs"))
     checkpoint_path = output_dir / "checkpoints" / train_cfg["training"]["save_name"]
+    latest_path = output_dir / "checkpoints" / "latest.pt"
     metrics_path = output_dir / "metrics" / "train_stage_a_summary.json"
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     metrics_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Resume from checkpoint
+    resume_path = args.resume or (str(latest_path) if latest_path.exists() else None)
+    if resume_path and Path(resume_path).exists():
+        LOGGER.info("Resuming from checkpoint %s", resume_path)
+        ckpt = torch.load(resume_path, map_location=device)
+        model.load_state_dict(ckpt["model_state"], strict=False)
+        if "optimizer_state" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state"])
+        start_epoch = ckpt.get("epoch", 0)
+        best_mrr = ckpt.get("best_val_mrr", float("-inf"))
+        LOGGER.info("Resumed at epoch %d, best_val_mrr=%.4f", start_epoch, best_mrr)
+
     global_step = 0
     grad_accum_steps = int(train_cfg["training"]["grad_accum_steps"])
     log_interval = int(train_cfg["training"].get("log_interval", 100))
-    for epoch in range(int(train_cfg["training"]["epochs"])):
+    for epoch in range(start_epoch, int(train_cfg["training"]["epochs"])):
         model.train()
         optimizer.zero_grad(set_to_none=True)
         running_loss = 0.0
@@ -180,13 +195,25 @@ def main() -> None:
             val_metrics["loss"],
             val_metrics["mrr"],
         )
+        # Unwrap DataParallel for portable checkpoints
+        save_state = {
+            k.replace("backbone.model.module.", "backbone.model."): v
+            for k, v in model.state_dict().items()
+        }
+        # Save latest checkpoint every epoch (for resume)
+        torch.save(
+            {
+                "model_state": save_state,
+                "model_config": model_cfg,
+                "train_config": train_cfg,
+                "optimizer_state": optimizer.state_dict(),
+                "epoch": epoch + 1,
+                "best_val_mrr": best_mrr,
+            },
+            latest_path,
+        )
         if val_metrics["mrr"] > best_mrr:
             best_mrr = val_metrics["mrr"]
-            # Unwrap DataParallel for portable checkpoints
-            save_state = {
-                k.replace("backbone.model.module.", "backbone.model."): v
-                for k, v in model.state_dict().items()
-            }
             torch.save(
                 {
                     "model_state": save_state,
@@ -196,6 +223,7 @@ def main() -> None:
                 },
                 checkpoint_path,
             )
+            LOGGER.info("New best MRR=%.4f, saved to %s", best_mrr, checkpoint_path)
 
     dump_json({"best_val_mrr": best_mrr, "checkpoint": str(checkpoint_path)}, metrics_path)
     LOGGER.info("Saved best checkpoint to %s", checkpoint_path)
