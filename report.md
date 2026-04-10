@@ -10,6 +10,12 @@ This project asks a narrow question: **can a ColBERT-style late-interaction retr
 
 Late interaction is a natural fit for this problem. Regulatory similarity is often driven by partial motif matches scattered across a sequence — a shared TATA box here, a common CTCF site there. Mean-pooled representations collapse all positional information into a single vector, potentially averaging away these sparse signals. ColBERT's MaxSim scoring preserves token-level alignment, letting the model attend to whichever local matches matter most for a given query-document pair.
 
+### 1.1 Problem Statement in Plain Terms
+
+The human genome contains approximately one million regulatory "switches" (cCREs) that control when and where genes are turned on. The ENCODE consortium has cataloged these switches and measured which proteins (transcription factors) bind to each one. The question we address is: **given only the raw DNA sequence of one switch — a string of A, T, G, C characters — can we find other switches that perform the same biological function?**
+
+The sole input to our model is the raw nucleotide sequence (~512 characters). No metadata, no annotations, no hand-engineered features. The model must learn, from sequence alone, which character patterns predict shared transcription factor binding. If it can, this demonstrates that DNA sequence contains sufficient information to recover regulatory function — and that a learned retrieval model can extract this signal better than simple string-matching approaches.
+
 ## 2. Biological Motivation
 
 ### 2.1 The cCRE Retrieval Task
