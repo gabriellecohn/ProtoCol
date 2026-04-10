@@ -22,6 +22,39 @@ class ColBERTRetriever(nn.Module):
         projected = F.normalize(self.projection(hidden), dim=-1)
         return projected, attention_mask
 
+    def encode_tokens(self, tokens: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode pre-tokenized inputs (skips CPU tokenization)."""
+        hidden, attention_mask = self.backbone.forward_tokens(tokens, self.device)
+        projected = F.normalize(self.projection(hidden), dim=-1)
+        return projected, attention_mask
+
+    @staticmethod
+    def _score_batched(
+        q_proj: torch.Tensor,
+        q_mask: torch.Tensor,
+        d_proj: torch.Tensor,
+        d_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Vectorized MaxSim scoring: (Q, Tq, F) x (D, Td, F) -> (Q, D)."""
+        # (Q, Tq, D, Td) — all pairwise token similarities
+        sim = torch.einsum("qif,djf->qidj", q_proj, d_proj)
+        # Mask out padding tokens in docs
+        sim = sim.masked_fill(~d_mask[None, None, :, :], -1e4)
+        # Max over doc tokens per query token, then mask query padding and sum
+        max_sim = sim.max(dim=-1).values          # (Q, Tq, D)
+        max_sim = max_sim * q_mask[:, :, None].float()
+        return max_sim.sum(dim=1)                  # (Q, D)
+
+    def score_token_batches(
+        self,
+        query_tokens: dict[str, torch.Tensor],
+        doc_tokens: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """Score pre-tokenized query and doc batches."""
+        q_proj, q_mask = self.encode_tokens(query_tokens)
+        d_proj, d_mask = self.encode_tokens(doc_tokens)
+        return self._score_batched(q_proj, q_mask, d_proj, d_mask)
+
     @staticmethod
     def _score_pair(
         query_tokens: torch.Tensor,
@@ -36,19 +69,6 @@ class ColBERTRetriever(nn.Module):
         return max_scores.sum()
 
     def score_sequences(self, query_sequences: list[str], doc_sequences: list[str]) -> torch.Tensor:
-        query_tokens, query_mask = self.encode(query_sequences)
-        doc_tokens, doc_mask = self.encode(doc_sequences)
-        rows = []
-        for q_idx in range(query_tokens.size(0)):
-            row_scores = []
-            for d_idx in range(doc_tokens.size(0)):
-                row_scores.append(
-                    self._score_pair(
-                        query_tokens[q_idx],
-                        query_mask[q_idx],
-                        doc_tokens[d_idx],
-                        doc_mask[d_idx],
-                    )
-                )
-            rows.append(torch.stack(row_scores))
-        return torch.stack(rows, dim=0)
+        q_proj, q_mask = self.encode(query_sequences)
+        d_proj, d_mask = self.encode(doc_sequences)
+        return self._score_batched(q_proj, q_mask, d_proj, d_mask)

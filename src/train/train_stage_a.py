@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader
 from src.models.losses import multi_positive_softmax_loss
 from src.train.trainer_utils import (
     GroupedPairDataset,
+    TokenizedCollator,
     build_retriever,
     collate_grouped_pairs,
     load_training_bundle,
@@ -46,8 +47,8 @@ def evaluate_model(model: torch.nn.Module, loader: DataLoader, temperature: floa
     reciprocal_ranks = []
     with torch.no_grad():
         for batch in loader:
-            docs, positive_mask = build_docs(batch)
-            scores = model.score_sequences(batch["query_sequences"], docs)
+            scores = model.score_token_batches(batch["query_tokens"], batch["doc_tokens"])
+            positive_mask = batch["positive_mask"]
             loss = multi_positive_softmax_loss(scores, positive_mask.to(scores.device), temperature=temperature)
             losses.append(float(loss.item()))
             for row_idx in range(scores.size(0)):
@@ -91,28 +92,43 @@ def main() -> None:
         seed=int(train_cfg["seed"]) + 17,
     )
 
+    model = build_retriever(model_cfg).to(device)
+
+    # Use pre-tokenizing collator so DataLoader workers handle tokenization
+    # on CPU while the GPU processes the current batch.
+    collator = TokenizedCollator(model.backbone.tokenize)
+    num_workers = int(train_cfg["training"].get("num_workers", 0))
+    if num_workers == 0:
+        num_workers = 4  # default to overlapping workers
     train_loader = DataLoader(
         train_dataset,
         batch_size=int(train_cfg["training"]["batch_size"]),
         shuffle=True,
-        num_workers=int(train_cfg["training"]["num_workers"]),
-        collate_fn=collate_grouped_pairs,
+        num_workers=num_workers,
+        collate_fn=collator,
+        persistent_workers=True,
+        prefetch_factor=2,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=int(train_cfg["training"]["batch_size"]),
         shuffle=False,
-        num_workers=int(train_cfg["training"]["num_workers"]),
-        collate_fn=collate_grouped_pairs,
+        num_workers=num_workers,
+        collate_fn=collator,
+        persistent_workers=True,
+        prefetch_factor=2,
     )
-
-    model = build_retriever(model_cfg).to(device)
+    gpu_ids = train_cfg["training"].get("gpu_ids")
+    if gpu_ids and len(gpu_ids) > 1 and hasattr(model, "backbone"):
+        LOGGER.info("Wrapping backbone encoder in DataParallel across GPUs %s", gpu_ids)
+        model.backbone.model = torch.nn.DataParallel(model.backbone.model, device_ids=gpu_ids)
     optimizer = AdamW(
         model.parameters(),
         lr=float(train_cfg["training"]["learning_rate"]),
         weight_decay=float(train_cfg["training"]["weight_decay"]),
     )
-    scaler_enabled = bool(train_cfg["training"].get("bf16", True)) and device == "cuda"
+    device_type = device.split(":")[0]
+    scaler_enabled = bool(train_cfg["training"].get("bf16", True)) and device_type == "cuda"
     autocast_dtype = torch.bfloat16 if scaler_enabled else torch.float32
     temperature = float(model_cfg.get("score_temperature", 0.02))
     best_mrr = float("-inf")
@@ -124,27 +140,37 @@ def main() -> None:
 
     global_step = 0
     grad_accum_steps = int(train_cfg["training"]["grad_accum_steps"])
+    log_interval = int(train_cfg["training"].get("log_interval", 100))
     for epoch in range(int(train_cfg["training"]["epochs"])):
         model.train()
         optimizer.zero_grad(set_to_none=True)
         running_loss = 0.0
+        epoch_step = 0
+        num_batches = len(train_loader)
         for batch in train_loader:
-            docs, positive_mask = build_docs(batch)
-            with torch.autocast(device_type=device, dtype=autocast_dtype, enabled=scaler_enabled):
-                scores = model.score_sequences(batch["query_sequences"], docs)
+            with torch.autocast(device_type=device_type, dtype=autocast_dtype, enabled=scaler_enabled):
+                scores = model.score_token_batches(batch["query_tokens"], batch["doc_tokens"])
                 loss = multi_positive_softmax_loss(
                     scores,
-                    positive_mask.to(scores.device),
+                    batch["positive_mask"].to(scores.device),
                     temperature=temperature,
                 ) / grad_accum_steps
             loss.backward()
             running_loss += float(loss.item())
             global_step += 1
+            epoch_step += 1
 
             if global_step % grad_accum_steps == 0:
                 clip_grad_norm_(model.parameters(), float(train_cfg["training"]["max_grad_norm"]))
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+
+            if epoch_step % log_interval == 0:
+                avg_loss = running_loss / epoch_step
+                LOGGER.info(
+                    "epoch=%d step=%d/%d loss=%.4f",
+                    epoch + 1, epoch_step, num_batches, avg_loss,
+                )
 
         val_metrics = evaluate_model(model, val_loader, temperature=temperature)
         LOGGER.info(
@@ -156,9 +182,14 @@ def main() -> None:
         )
         if val_metrics["mrr"] > best_mrr:
             best_mrr = val_metrics["mrr"]
+            # Unwrap DataParallel for portable checkpoints
+            save_state = {
+                k.replace("backbone.model.module.", "backbone.model."): v
+                for k, v in model.state_dict().items()
+            }
             torch.save(
                 {
-                    "model_state": model.state_dict(),
+                    "model_state": save_state,
                     "model_config": model_cfg,
                     "train_config": train_cfg,
                     "best_val_mrr": best_mrr,

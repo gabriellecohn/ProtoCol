@@ -1,0 +1,21 @@
+seed: 13
+device: cuda:0
+output_dir: outputs/dnabert2_small
+data:
+  manifest_path: data/interim/manifests/small.csv
+  pair_path: data/processed/stage_a/small_pairs.csv
+  sequence_column: sequence_512
+  negatives_per_query: 6
+model:
+  config_path: configs/model/dnabert2_colbert_local.yaml
+training:
+  epochs: 10
+  batch_size: 20
+  grad_accum_steps: 1
+  gpu_ids: [0, 1]
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  num_workers: 8
+  bf16: false
+  max_grad_norm: 1.0
+  save_name: dnabert2_small_best.pt

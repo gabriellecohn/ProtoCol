@@ -1,0 +1,16 @@
+seed: 13
+device: cuda:0
+data:
+  manifest_path: data/interim/manifests/small.csv
+  pair_path: data/processed/stage_a/small_pairs.csv
+  sequence_column: sequence_512
+evaluation:
+  top_k:
+    - 1
+    - 5
+    - 10
+    - 50
+  random_seed: 13
+  kmer_size: 6
+  sample_queries: 512
+  sample_corpus: 2048

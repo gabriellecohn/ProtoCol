@@ -34,10 +34,57 @@ def load_checkpoint_model(checkpoint_path: str | Path, device: str) -> torch.nn.
     return model
 
 
+def encode_corpus(model: torch.nn.Module, doc_sequences: list[str], batch_size: int = 16) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pre-encode all corpus documents, returning (token_embeddings, mask) on CPU.
+
+    Batches are padded to a common sequence length before concatenation because
+    each batch is independently padded by the tokenizer.
+    """
+    all_tokens, all_masks = [], []
+    with torch.no_grad():
+        for i in range(0, len(doc_sequences), batch_size):
+            batch = doc_sequences[i : i + batch_size]
+            toks, mask = model.backbone.forward_sequences(batch, model.device)
+            proj = torch.nn.functional.normalize(model.projection(toks), dim=-1)
+            all_tokens.append(proj.cpu())
+            all_masks.append(mask.cpu())
+    max_len = max(t.size(1) for t in all_tokens)
+    padded_tokens, padded_masks = [], []
+    for t, m in zip(all_tokens, all_masks):
+        pad = max_len - t.size(1)
+        if pad > 0:
+            t = torch.nn.functional.pad(t, (0, 0, 0, pad))
+            m = torch.nn.functional.pad(m, (0, pad))
+        padded_tokens.append(t)
+        padded_masks.append(m)
+    return torch.cat(padded_tokens, dim=0), torch.cat(padded_masks, dim=0)
+
+
 def score_with_model(model: torch.nn.Module, query_sequence: str, doc_sequences: list[str]) -> np.ndarray:
     with torch.no_grad():
         scores = model.score_sequences([query_sequence], doc_sequences)
     return scores[0].detach().cpu().numpy()
+
+
+def score_query_against_corpus(
+    model: torch.nn.Module,
+    query_sequence: str,
+    doc_tokens: torch.Tensor,
+    doc_masks: torch.Tensor,
+) -> np.ndarray:
+    """Score a single query against pre-encoded corpus token embeddings."""
+    with torch.no_grad():
+        q_hidden, q_mask = model.backbone.forward_sequences([query_sequence], model.device)
+        q_proj = torch.nn.functional.normalize(model.projection(q_hidden), dim=-1)
+        q_proj_single = q_proj[0]   # (Q, F)
+        q_mask_single = q_mask[0]   # (Q,)
+        doc_tokens_dev = doc_tokens.to(model.device)
+        doc_masks_dev = doc_masks.to(model.device)
+        scores = []
+        for d_idx in range(doc_tokens_dev.size(0)):
+            s = model._score_pair(q_proj_single, q_mask_single, doc_tokens_dev[d_idx], doc_masks_dev[d_idx])
+            scores.append(s.item())
+    return np.array(scores)
 
 
 def rank_ids_from_scores(doc_ids: list[str], scores: np.ndarray, query_id: str) -> list[str]:
@@ -56,11 +103,14 @@ def main() -> None:
         default="kmer",
     )
     parser.add_argument("--output", default="outputs/metrics/eval_screen.json")
+    parser.add_argument("--tf-activity", default=None, help="Path to TF vectors .npz (overrides manifest activity_vector)")
     args = parser.parse_args()
 
     cfg = load_yaml(args.config)
     set_global_seed(int(cfg["seed"]))
-    device = "cuda" if cfg.get("device", "cpu") == "cuda" and torch.cuda.is_available() else "cpu"
+    device = cfg.get("device", "cpu")
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        device = "cpu"
 
     manifest = pd.read_csv(cfg["data"]["manifest_path"])
     pairs = pd.read_csv(cfg["data"]["pair_path"])
@@ -77,7 +127,18 @@ def main() -> None:
     doc_ids = corpus_df["ccre_id"].tolist()
     doc_sequences = corpus_df[sequence_column].tolist()
     label_lookup = manifest.set_index("ccre_id")["ccre_class"].astype(str).to_dict()
-    activity_lookup = manifest.set_index("ccre_id")["activity_vector"].apply(parse_json_list).to_dict()
+    if args.tf_activity:
+        LOGGER.info("Loading TF activity vectors from %s", args.tf_activity)
+        tf_data = np.load(args.tf_activity, allow_pickle=False)
+        tf_ccre_ids = tf_data["ccre_ids"]
+        tf_matrix = tf_data["tf_matrix"]
+        tf_lookup = {cid: i for i, cid in enumerate(tf_ccre_ids)}
+        activity_lookup = {
+            cid: tf_matrix[tf_lookup[cid]].astype(float).tolist() if cid in tf_lookup else []
+            for cid in manifest["ccre_id"]
+        }
+    else:
+        activity_lookup = manifest.set_index("ccre_id")["activity_vector"].apply(parse_json_list).to_dict()
     relevance_lookup = (
         pairs[(pairs["split"] == "test") & (pairs["label"] == 1)]
         .groupby("query_id")["doc_id"]
@@ -86,6 +147,11 @@ def main() -> None:
     )
 
     model = load_checkpoint_model(args.checkpoint, device) if args.checkpoint else None
+    doc_tokens_cache: torch.Tensor | None = None
+    doc_masks_cache: torch.Tensor | None = None
+    if model is not None and hasattr(model, "backbone") and hasattr(model, "projection"):
+        LOGGER.info("Pre-encoding %d corpus documents...", len(doc_sequences))
+        doc_tokens_cache, doc_masks_cache = encode_corpus(model, doc_sequences)
     results = {f"Recall@{k}": [] for k in top_k}
     results.update({"MRR": [], "nDCG": []})
     for k in top_k:
@@ -103,7 +169,10 @@ def main() -> None:
         else:
             if model is None:
                 raise ValueError("--checkpoint is required for --baseline model")
-            scores = score_with_model(model, row.__getattribute__(sequence_column), doc_sequences)
+            if doc_tokens_cache is not None:
+                scores = score_query_against_corpus(model, row.__getattribute__(sequence_column), doc_tokens_cache, doc_masks_cache)
+            else:
+                scores = score_with_model(model, row.__getattribute__(sequence_column), doc_sequences)
 
         ranked_ids = rank_ids_from_scores(doc_ids, scores, row.ccre_id)
         relevant_ids = relevance_lookup[row.ccre_id]

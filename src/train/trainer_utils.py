@@ -102,6 +102,31 @@ def collate_grouped_pairs(batch: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+class TokenizedCollator:
+    """Collate function that pre-tokenizes sequences on CPU.
+
+    When used with ``num_workers > 0``, DataLoader workers tokenize the next
+    batch while the GPU processes the current one, overlapping CPU and GPU work.
+    """
+
+    def __init__(self, tokenize_fn: Any) -> None:
+        self.tokenize_fn = tokenize_fn
+
+    def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
+        base = collate_grouped_pairs(batch)
+        positives = base["positive_sequences"]
+        negatives = [seq for seqs in base["negative_sequences"] for seq in seqs]
+        docs = positives + negatives
+        positive_mask = torch.zeros((len(base["query_sequences"]), len(docs)), dtype=torch.bool)
+        for idx in range(len(positives)):
+            positive_mask[idx, idx] = True
+        return {
+            "query_tokens": self.tokenize_fn(base["query_sequences"]),
+            "doc_tokens": self.tokenize_fn(docs),
+            "positive_mask": positive_mask,
+        }
+
+
 def build_retriever(model_cfg: dict[str, Any]) -> torch.nn.Module:
     model_type = model_cfg["model_type"]
     backbone_keys = {field.name for field in fields(BackboneConfig)}

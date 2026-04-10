@@ -14,6 +14,7 @@ except ImportError:  # pragma: no cover
     AutoTokenizer = None
 
 try:
+    import torch.distributed.tensor  # noqa: F401 — peft 0.18 references this as an attribute
     from peft import LoraConfig, TaskType, get_peft_model
 except ImportError:  # pragma: no cover
     LoraConfig = None
@@ -79,44 +80,83 @@ class DNAEncoderBackbone(nn.Module):
         if AutoModel is None or AutoTokenizer is None:
             raise ImportError("transformers is required for DNABERT-2 backbones")
 
+        from transformers import AutoConfig
+        from transformers.dynamic_module_utils import get_class_from_dynamic_module
         self.tokenizer = AutoTokenizer.from_pretrained(
             config.model_name,
             trust_remote_code=config.trust_remote_code,
             use_fast=False,
         )
-        self.model = AutoModel.from_pretrained(
+        hf_config = AutoConfig.from_pretrained(
             config.model_name,
             trust_remote_code=config.trust_remote_code,
         )
+        auto_map = getattr(hf_config, "auto_map", {})
+        model_class_ref = auto_map.get("AutoModel")
+        if model_class_ref and config.trust_remote_code:
+            model_class = get_class_from_dynamic_module(
+                model_class_ref,
+                config.model_name,
+            )
+            # Disable bundled Triton flash attention — the kernel uses the old
+            # tl.dot(trans_b=True) API which was removed in newer Triton versions.
+            # bert_layers.py falls back to standard attention when this is None.
+            import sys
+            for _mod in sys.modules.values():
+                if hasattr(_mod, "flash_attn_qkvpacked_func"):
+                    _mod.flash_attn_qkvpacked_func = None
+            model_class.config_class = type(hf_config)
+            self.model = model_class.from_pretrained(
+                config.model_name,
+                config=hf_config,
+            )
+        else:
+            self.model = AutoModel.from_pretrained(
+                config.model_name,
+                config=hf_config,
+                trust_remote_code=config.trust_remote_code,
+            )
         self.hidden_size = int(self.model.config.hidden_size)
-        if config.gradient_checkpointing and hasattr(self.model, "gradient_checkpointing_enable"):
-            self.model.gradient_checkpointing_enable()
         if config.use_lora and get_peft_model is not None and LoraConfig is not None:
+            # DNABERT-2 uses a fused Wqkv projection; auto-detection fails for
+            # custom model classes so we name the target modules explicitly.
             lora_cfg = LoraConfig(
                 task_type=TaskType.FEATURE_EXTRACTION,
                 r=config.lora_rank,
                 lora_alpha=config.lora_alpha,
                 lora_dropout=config.lora_dropout,
                 bias="none",
+                target_modules=["Wqkv", "dense"],
             )
             self.model = get_peft_model(self.model, lora_cfg)
+        if config.gradient_checkpointing and hasattr(self.model, "gradient_checkpointing_enable"):
+            self.model.gradient_checkpointing_enable()
 
-    def forward_sequences(self, sequences: list[str], device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    def tokenize(self, sequences: list[str]) -> dict[str, torch.Tensor]:
+        """Tokenize sequences on CPU (no GPU transfer)."""
         if self.is_fallback:
-            return self.model.forward_sequences(sequences, device)
-
-        tokens = self.tokenizer(
+            input_ids, attention_mask = self.model._tokenize(sequences)
+            return {"input_ids": input_ids, "attention_mask": attention_mask}
+        return dict(self.tokenizer(
             sequences,
             return_tensors="pt",
             padding=True,
             truncation=True,
             max_length=self.config.max_length,
-        )
-        tokens = {key: value.to(device) for key, value in tokens.items()}
-        outputs = self.model(**tokens)
-        hidden = outputs.last_hidden_state
-        attention_mask = tokens["attention_mask"].bool()
-        return hidden, attention_mask
+        ))
+
+    def forward_tokens(self, tokens: dict[str, torch.Tensor], device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run forward pass on pre-tokenized inputs."""
+        tokens_dev = {k: v.to(device) for k, v in tokens.items()}
+        if self.is_fallback:
+            hidden = self.model.embedding(tokens_dev["input_ids"])
+            return hidden, tokens_dev["attention_mask"]
+        outputs = self.model(**tokens_dev)
+        hidden = outputs.last_hidden_state if hasattr(outputs, "last_hidden_state") else outputs[0]
+        return hidden, tokens_dev["attention_mask"].bool()
+
+    def forward_sequences(self, sequences: list[str], device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.forward_tokens(self.tokenize(sequences), device)
 
 
 def build_backbone(config_dict: dict[str, Any]) -> DNAEncoderBackbone:
