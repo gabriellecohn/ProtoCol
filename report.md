@@ -2,328 +2,245 @@
 
 ## 1. Introduction
 
-Candidate cis-regulatory elements (cCREs) — promoters, enhancers, insulators — are the core switches of gene regulation. The ENCODE SCREEN registry catalogs over one million human cCREs classified by epigenomic signatures (PLS, pELS, dELS, CTCF-only, DNase-H3K4me3), but finding functionally similar elements given only a query sequence remains an open retrieval problem.
+The human genome contains approximately one million regulatory "switches" called candidate cis-regulatory elements (cCREs) — promoters, enhancers, and insulators that control when and where genes are turned on. The ENCODE SCREEN registry has cataloged these elements and classified them by epigenomic signatures, but finding functionally similar elements given only a raw DNA sequence remains an open retrieval problem.
 
-Standard approaches to sequence similarity — k-mer counting, global alignment — capture lexical overlap but miss the sparse, position-dependent motif grammar that defines regulatory function. A promoter and an enhancer may share GC content and even individual transcription factor binding sites, yet serve entirely different roles depending on motif arrangement and spacing.
+This project asks: **can a ColBERT-style late-interaction retrieval model, built on a pretrained DNA language model, recover biologically similar regulatory elements better than simpler baselines?**
 
-This project asks a narrow question: **can a ColBERT-style late-interaction retrieval model, built on a pretrained DNA language model, recover biologically similar regulatory elements better than simpler baselines?**
+### 1.1 Problem Statement
 
-Late interaction is a natural fit for this problem. Regulatory similarity is often driven by partial motif matches scattered across a sequence — a shared TATA box here, a common CTCF site there. Mean-pooled representations collapse all positional information into a single vector, potentially averaging away these sparse signals. ColBERT's MaxSim scoring preserves token-level alignment, letting the model attend to whichever local matches matter most for a given query-document pair.
+The sole input to our model is the raw nucleotide sequence — a string of A, T, G, C characters, approximately 512 characters long. No metadata, no annotations, no hand-engineered features. The model must learn, from sequence alone, which character patterns predict shared regulatory function. If it can, this demonstrates that DNA sequence contains sufficient information to recover biological similarity — and that a learned retrieval model can extract this signal better than simple string-matching approaches.
 
-### 1.1 Problem Statement in Plain Terms
+### 1.2 Why Late Interaction
 
-The human genome contains approximately one million regulatory "switches" (cCREs) that control when and where genes are turned on. The ENCODE consortium has cataloged these switches and measured which proteins (transcription factors) bind to each one. The question we address is: **given only the raw DNA sequence of one switch — a string of A, T, G, C characters — can we find other switches that perform the same biological function?**
+Regulatory elements are modular — their function arises from combinations of short transcription factor (TF) binding motifs (6–20 bp) embedded in longer sequences (200–1000+ bp). Two enhancers may be functionally similar because they share three out of five binding sites, even if those sites appear at different positions and the intervening sequence is unrelated.
 
-The sole input to our model is the raw nucleotide sequence (~512 characters). No metadata, no annotations, no hand-engineered features. The model must learn, from sequence alone, which character patterns predict shared transcription factor binding. If it can, this demonstrates that DNA sequence contains sufficient information to recover regulatory function — and that a learned retrieval model can extract this signal better than simple string-matching approaches.
-
-## 2. Biological Motivation
-
-### 2.1 The cCRE Retrieval Task
-
-Given a query cCRE sequence, rank all other cCREs in a held-out corpus by biological similarity. "Biologically similar" is defined by weak supervision from two ENCODE data sources: (1) SCREEN regulatory class membership, and (2) shared transcription factor binding profiles from 2,818 TF ChIP-seq experiments. Two cCREs are considered positives when they share the same class and have high Jaccard similarity over their TF binding vectors — i.e., they are bound by similar sets of transcription factors.
-
-This framing is deliberately narrow. We are not predicting enhancer-promoter interactions, modeling 3D chromatin architecture, or attempting de novo motif discovery. The claim is limited to whether learned sequence representations can capture enough regulatory grammar to outperform string-matching baselines on a retrieval task.
-
-### 2.2 Why Late Interaction
-
-Regulatory elements are modular — their function arises from combinations of short binding motifs (6-20 bp) embedded in longer sequences (200-1000+ bp). Two enhancers may be functionally similar because they share three out of five binding sites, even if those sites appear at different positions and the intervening sequence is unrelated.
-
-This structure maps directly onto the ColBERT scoring model:
-
-- **Token embeddings** capture local sequence context at each position.
-- **MaxSim** finds the best-matching position in the document for each query token, tolerating positional variation.
-- **Summation** aggregates evidence across all query positions, rewarding partial motif overlap without requiring global alignment.
+ColBERT's MaxSim scoring is a natural fit:
+- **Token embeddings** capture local sequence context at each position
+- **MaxSim** finds the best-matching position in the document for each query token, tolerating positional variation
+- **Summation** aggregates evidence across all query positions, rewarding partial motif overlap without requiring global alignment
 
 Mean pooling, by contrast, compresses the full sequence into a single vector, making it difficult to distinguish "shares 3 of 5 motifs" from "shares 0 of 5 motifs but has similar base composition."
 
-## 3. Dataset Construction
+## 2. Dataset
 
-### 3.1 Source Data
+### 2.1 Source: ENCODE SCREEN Registry
 
-We use the ENCODE SCREEN Registry V3 (GRCh38), which contains **1,063,878 classified cCREs** across five regulatory classes:
+We use cCREs from the ENCODE SCREEN V3 registry (GRCh38), which catalogs 1,063,878 human cCREs classified into 5 regulatory classes based on combinations of histone marks and chromatin accessibility:
 
-| Class | Count | Description |
-|-------|-------|-------------|
-| dELS | 789,200 | Distal enhancer-like signature |
-| pELS | 172,027 | Proximal enhancer-like signature |
-| PLS | 40,891 | Promoter-like signature |
-| CTCF-only | 35,839 | CTCF-bound insulator elements |
-| DNase-H3K4me3 | 25,921 | Open chromatin with H3K4me3 mark |
+| Class | Full Name | Description | Registry Count |
+|-------|-----------|-------------|---------------|
+| PLS | Promoter-like signature | Near gene starts, high H3K4me3 | ~40k |
+| pELS | Proximal enhancer-like | Near genes, high H3K27ac | ~120k |
+| dELS | Distal enhancer-like | Far from genes, high H3K27ac | ~790k |
+| CTCF-only | CTCF-bound only | Only CTCF signal, no histone marks | ~80k |
+| DNase-H3K4me3 | DNase with H3K4me3 | Open chromatin + H3K4me3 | ~30k |
 
-Each cCRE is annotated with genomic coordinates (hg38), a primary regulatory class, and a CTCF-binding status flag. The class distribution is heavily skewed toward distal enhancers (74%).
+For our experiments, we use a 50,000-element subset with chromosome-held-out splits (val: chr2/chr10, test: chr1/chr8/chr21) to prevent data leakage from linked regulatory elements on the same chromosome.
 
-### 3.2 Sequence Extraction
+### 2.2 Similarity Signal: TF Binding Profiles
 
-For each cCRE, we extract a **512 bp window** centered at the element midpoint from the hg38 reference genome using pyfaidx. Sequences extending beyond chromosome boundaries are N-padded to maintain fixed length. GC content is computed per sequence for downstream stratification.
+Defining "biologically similar" is the central challenge. We explored two approaches:
 
-The 512 bp window captures the core regulatory element plus flanking context. Longer windows (1024, 2048 bp) are supported for ablation but are not used in the primary experiments due to GPU memory constraints on the RTX 2080 Ti.
+**Initial approach: class-derived proxy (6 dimensions).** We encoded the 5 class labels plus CTCF-binding status as a 6-dimensional binary vector. This proved insufficient — with only 6 dimensions, same-class elements almost always exceeded the positive threshold, reducing the task to a trivial 5-way classification. Training with this signal produced models that converged to the random baseline (val MRR ≈ 0.05 across 10 epochs).
 
-### 3.3 Chromosome-Held-Out Splits
+**Enrichment: ENCODE TF ChIP-seq binding profiles (2,818 dimensions).** We integrated the ENCODE TF peaks matrix (ENCFF257UKO), which records for each cCRE which of 2,818 transcription factor ChIP-seq experiments show a binding peak. The result is a 2,818-dimensional binary vector per cCRE.
 
-To prevent data leakage from genomically proximal elements, we use chromosome-level held-out splits:
+### 2.3 Exploratory Data Analysis
 
-- **Validation**: chr2, chr10
-- **Test**: chr1, chr8, chr21
-- **Train**: all remaining chromosomes
+We conducted a comprehensive analysis of the TF binding vectors across the 50k subset to understand the data distribution and inform threshold selection.
 
-This is stricter than random splitting, which would allow nearby elements on the same chromosome to appear in both train and test sets.
+**TF binding density per cCRE.** The distribution is heavily right-skewed with a median of 7 TF experiments per cCRE and a long tail extending to ~1,889. Critically, **20.6% of cCREs (10,301 elements) have zero TF peaks**, meaning they cannot participate meaningfully in TF-supervised training.
 
-### 3.4 Subset Tiers
+![TF binding density per cCRE](figures/task1_ccre_tf_density.png)
 
-We construct three dataset tiers by stratified sampling from the full manifest:
+**TF experiment coverage.** Each TF experiment covers a variable number of cCREs. The top experiments (ZNF687, CTCF, POLR2A) each bind ~4,000–5,000 elements (~8–10% of the subset), but no single experiment exceeds 10%, so there are no truly "ubiquitous" TFs to filter.
 
-| Tier | cCREs | Training queries | Pairs |
-|------|-------|-----------------|-------|
-| Debug | 10,000 | 7,177 | 190,000 |
-| Small | 50,000 | 35,883 | 950,000 |
-| Medium | 200,000 | ~143,000 | ~3.8M (est.) |
+![cCRE count per TF experiment](figures/task1_experiment_density.png)
 
-### 3.5 Activity Annotations
+**Pairwise Jaccard distributions.** The Jaccard similarity between TF binding vectors is extremely sparse. For random pairs, the median Jaccard is 0.000 (mean 0.010). For same-class pairs, the median is still 0.000 (mean 0.038), with only the 95th percentile reaching 0.21. This means most same-class elements share almost no TF binding — the signal is concentrated in a small fraction of pairs.
 
-#### Initial approach: class-derived proxy (6 dimensions)
+![Jaccard distributions: random vs same-class pairs](figures/task1_jaccard_distributions.png)
 
-The V3 registry provides class labels and CTCF-binding status but does not include per-biosample activity signals. Our initial approach encoded the available annotations as a 6-dimensional binary activity vector per cCRE:
+**Overlap count analysis.** Among same-class pairs, 22.2% share ≥ 2 TF experiments, but the overlap = 2 pairs are dominated by housekeeping TFs: CTCF (28%), POLR2A/POLR2AphosphoS5 (35%), and MAX. These are regulatory machinery common to many elements and do not indicate functional similarity.
 
-```
-[PLS, pELS, dELS, DNase-H3K4me3, CTCF-only, CTCF-bound]
-```
+![TF overlap count distribution](figures/task1_overlap_distribution.png)
 
-This proved insufficient as a similarity signal. With only 6 binary dimensions and 5 classes, same-class cCREs almost always share ≥ 2 dimensions (triggering the positive threshold), making the pair labels essentially equivalent to class membership. Training with this signal produced a model that converged to the random baseline (val MRR ≈ 0.05 after 10 epochs; see Section 4.7) because there was no within-class structure for the model to learn.
+**Positive yield at various thresholds:**
 
-#### Enrichment: ENCODE TF binding profiles (2,818 dimensions)
+| Threshold | Median positives/query | Queries with 0 positives | Queries with ≥ 4 positives |
+|-----------|----------------------|-------------------------|---------------------------|
+| Jaccard ≥ 0.3 | 0 | 71.3% | 9.2% |
+| Jaccard ≥ 0.5 | 0 | 89.1% | 2.6% |
+| Overlap ≥ 2 | 43 | 14.5% | 80.9% |
+| Overlap ≥ 3 | 27 | 22.8% | 71.7% |
+| Overlap ≥ 5 | 12 | 35.3% | 59.0% |
 
-To provide a biologically meaningful similarity signal, we integrated the ENCODE TF ChIP-seq peaks matrix (ENCFF257UKO). This matrix records, for each cCRE, which of 2,818 transcription factor ChIP-seq experiments show a binding peak overlapping the element. The result is a 2,818-dimensional binary vector per cCRE indicating the element's TF binding profile.
+This reveals a fundamental tension: strict Jaccard thresholds (≥ 0.5) produce almost no positives, while lenient overlap thresholds (≥ 2) produce positives dominated by housekeeping TF co-occurrence.
 
-**Data integration pipeline:**
-1. The TF peaks matrix uses rDHS accessions (EH38D...) while cCRE manifests use cCRE accessions (EH38E...). We use the GRCh38-cCREs.bed file to map between the two namespaces.
-2. The full matrix (2.35M rDHS × 2,818 TF experiments, 13 GB uncompressed) is streamed line-by-line, extracting only rows matching our target cCREs.
-3. For the 50k subset: 47,885 / 50,000 cCREs matched (96%); unmatched elements receive zero-filled vectors.
+**k-mer vs TF Jaccard correlation.** To validate that TF binding similarity is recoverable from sequence, we compared 6-mer cosine similarity against TF Jaccard for the 100 highest and 100 lowest Jaccard same-class pairs (requiring ≥ 5 TFs each). Pearson r = 0.21 — a weak but nonzero correlation. High-TF-Jaccard pairs have slightly higher k-mer similarity (0.159 vs 0.136), suggesting there is sequence signal, but it is subtle.
 
-**Binding density statistics (50k subset):**
-- Median TFs per cCRE: **8** (range: 0–200+)
-- Median cCREs per TF experiment: **662.5**
-- TF experiments span 43 tissue ontologies and include CTCF, cohesin components, lineage-specifying TFs (GATA, FOX, SOX families), chromatin remodelers, and general transcription machinery
+![k-mer similarity vs TF Jaccard](figures/task4_kmer_vs_jaccard.png)
 
-**Why this signal is richer:** Two cCREs classified as "dELS" (distal enhancer-like) may serve completely different biological roles — one active in hematopoiesis (bound by GATA1, TAL1, RUNX1) and another in neural development (bound by SOX2, PAX6, NEUROD1). The TF binding vector captures this functional distinction. Crucially, this is a similarity signal that k-mer counting cannot replicate: shared TF binding depends on specific motif presence and genomic context, not overall sequence composition.
+**t-SNE of TF binding vectors by class.** A t-SNE projection (10k subsample) of the 2,818-dim TF vectors colored by regulatory class shows that dELS (dominant class) exhibits clear internal substructure — multiple distinct clusters corresponding to different regulatory programs. PLS and CTCF-only form identifiable clusters. This confirms there is within-class structure in the TF binding data that a model could potentially learn.
 
-### 3.6 Pair Construction
+![t-SNE of TF binding vectors by regulatory class](figures/task5_t-sne_by_class.png)
 
-Training pairs are built via weak supervision using the following criteria:
+**Ubiquitous TF filtering.** We tested removing TF experiments binding > 10%, 20%, or 30% of cCREs. No experiments exceeded even the 10% threshold, so ubiquitous TF filtering is unnecessary for this dataset.
 
-**Positives** (up to 4 per query): From same-class candidates (sampled up to 512), a candidate is positive if:
-- Binary Jaccard similarity of TF binding vectors >= 0.5, **or**
-- Overlap count (shared active TF dimensions) >= 2
+![Ubiquitous TF filtering comparison](figures/task2_ubiq_filtering.png)
 
-Additional positives are drawn from biosample-group-matched elements.
+### 2.4 Limitations of the SCREEN/TF Dataset
 
-**Negatives** (up to 15 per query), stratified from four sources:
-1. Same GC-content bin, any class
-2. Hard negatives: same class but TF Jaccard <= 0.1 (functionally distinct despite same regulatory class)
-3. Different class, same GC bin
-4. Random within-split pool
+The EDA reveals several challenges with using SCREEN cCREs + TF binding as a retrieval benchmark:
 
-This stratification ensures the model sees negatives that vary in difficulty — from trivially different (wrong class) to subtly different (same class, different TF program). The hard negatives are particularly valuable with the TF signal: two dELS elements with Jaccard ≤ 0.1 share almost no TF binding, forcing the model to learn sequence features that distinguish their regulatory programs.
+1. **Sparsity.** 20.6% of cCREs have zero TF peaks, and the median is only 7 out of 2,818 experiments. Most pairwise Jaccard values are zero.
+2. **Experimental bias.** TF binding is measured in specific cell lines (HepG2, K562, etc.), not universally. Low Jaccard between two enhancers may mean "different function" or simply "tested in different labs."
+3. **Weak sequence-function correlation.** Pearson r = 0.21 between k-mer similarity and TF Jaccard suggests the sequence signal exists but is subtle — the model needs to learn complex motif grammar, not just composition.
+4. **Threshold sensitivity.** No threshold cleanly separates meaningful positives from noise. Strict thresholds starve the training of positives; lenient thresholds admit housekeeping TF noise.
 
-### 3.7 Pair Building Optimization
+These limitations motivate our planned transition to the DeepSEA dataset (see Section 6).
 
-The pair construction pipeline processes each query by iterating over candidate matches and computing pairwise similarity. At scale (50k-200k cCREs), two bottlenecks dominate:
+## 3. Model Architecture
 
-1. **DataFrame row access**: The original implementation used `manifest.iloc[idx]` inside the inner loop to retrieve activity vectors. On a 50k-row DataFrame, this involves index validation, type checking, and Series construction per call — at ~512 candidates per query and 50k queries, this produces ~25 million slow DataFrame accesses.
+### 3.1 Backbone: DNABERT-2
 
-   **Fix**: Pre-extract all columns into plain Python lists and NumPy arrays before the loop. Inner-loop access becomes a direct list index (`activity_arrays[idx]`), reducing per-access cost by roughly two orders of magnitude.
+We use DNABERT-2 (117M parameters), a BERT-based DNA language model pretrained on multi-species genomes with Byte Pair Encoding (BPE) tokenization. Key specifications:
+- **Hidden dimension:** 768
+- **Layers:** 12 transformer layers
+- **Attention heads:** 12
+- **Vocabulary:** 4,096 BPE tokens
+- **Max sequence length:** 512 tokens
 
-2. **Repeated boolean mask construction**: Negative sampling originally recomputed full-DataFrame boolean masks per query to find different-class and random-pool candidates:
-   ```python
-   manifest.index[(manifest["split"] == split) & (manifest["ccre_class"] != cls)]
-   ```
-   Each such expression creates and ANDs temporary boolean arrays over the entire manifest.
+### 3.2 ColBERT Late-Interaction Scoring
 
-   **Fix**: Pre-build lookup dictionaries keyed by `(split, class)`, `(split, gc_bin)`, and `split` before the main loop. Negative sampling then becomes dict lookups and list filtering.
-
-These optimizations reduced pair building time for the 50k subset from an estimated 3+ hours to approximately 20 minutes — a roughly 10x speedup — without changing the output.
-
-## 4. Model Architecture
-
-### 4.1 Backbone: DNABERT-2
-
-We use DNABERT-2 (117M parameters), a BERT-based DNA language model pretrained on multi-species genomes with Byte Pair Encoding (BPE) tokenization. Unlike character-level DNA tokenizers, BPE captures variable-length k-mer patterns learned from the pretraining corpus.
-
-Key configuration:
-- **Hidden dimension**: 768
-- **Layers**: 12 transformer layers
-- **Attention heads**: 12
-- **Vocabulary**: 4,096 BPE tokens
-- **Max sequence length**: 512 tokens
-
-### 4.2 LoRA Fine-Tuning
-
-Rather than updating all 117M parameters, we apply Low-Rank Adaptation (LoRA) to the attention projection matrices:
-- **Rank**: 16
-- **Alpha**: 32 (effective scaling = alpha/rank = 2.0)
-- **Dropout**: 0.1
-- **Target modules**: attention query/key/value projections
-- **Bias**: none
-
-This reduces the trainable parameter count while preserving the pretrained representations.
-
-### 4.3 ColBERT Late-Interaction Scoring
-
-The retrieval model follows the ColBERT architecture adapted for DNA sequences:
-
-1. **Shared encoder**: Both query and document sequences pass through the same DNABERT-2 backbone.
-2. **Projection**: Token hidden states (768-dim) are projected to 64 dimensions via a linear layer (no bias).
-3. **L2 normalization**: All projected token embeddings are unit-normalized.
-4. **MaxSim scoring**: For a query Q with tokens {q_1, ..., q_m} and document D with tokens {d_1, ..., d_n}:
+The ColBERT architecture adds a learned linear projection from the backbone's 768-dim hidden states to 64-dim normalized token embeddings. Scoring follows the standard ColBERT MaxSim formulation:
 
 $$\text{score}(Q, D) = \sum_{i=1}^{m} \max_{j=1}^{n} (q_i \cdot d_j) \cdot \mathbb{1}[q_i \text{ not padding}]$$
 
-Padding tokens are masked out in both query and document via attention masks.
+### 3.3 Fine-Tuning with LoRA
 
-### 4.4 Training Objective
+Rather than full fine-tuning, we apply Low-Rank Adaptation (LoRA) to the backbone's query/key/value projections (`Wqkv`) and dense layers, with rank 16, alpha 32, and dropout 0.1. This reduces trainable parameters from 117M to ~2M while preserving pretrained representations.
 
-We use a multi-positive softmax loss with temperature scaling:
+### 3.4 Training Objective
+
+Multi-positive softmax (InfoNCE) loss with temperature τ = 0.1:
 
 $$\mathcal{L} = -\frac{1}{|B|} \sum_{i \in B} \left[ \log \frac{\sum_{j \in P_i} \exp(s_{ij} / \tau)}{\sum_{k=1}^{N} \exp(s_{ik} / \tau)} \right]$$
 
-where $s_{ij}$ is the ColBERT score between query $i$ and document $j$, $P_i$ is the set of positive documents for query $i$, $N$ is the total number of documents in the batch, and $\tau$ is the temperature parameter (set to 0.1; see Section 4.7 for analysis of why τ=0.05 caused training stagnation).
+We use gradient accumulation (4 steps) to stabilize optimization, giving an effective batch of 80 queries per weight update.
 
-The denominator includes all documents in the batch (positives from other queries serve as in-batch negatives), providing additional contrastive signal without extra computation.
+## 4. Baselines
 
-### 4.5 Training Pipeline Optimization
+Each baseline answers a specific question about the retrieval system, ordered from confound checks to architectural comparisons.
 
-Naive implementation of the ColBERT training loop achieves only ~16% GPU utilization on dual RTX 2080 Ti cards, with the GPU idle most of the time. Two optimizations raised sustained utilization to ~95%:
+### 4.1 Nuisance Baselines
 
-**Pre-tokenizing DataLoader.** In the original pipeline, each training step serializes CPU tokenization and GPU computation: tokenize queries on CPU, encode on GPU, tokenize documents on CPU, encode on GPU, score, backward. The GPU idles during both tokenization phases.
+**Random.** Documents scored with uniform random values. Establishes the absolute floor.
 
-We restructure the pipeline so that tokenization runs in DataLoader worker processes. A custom collator pre-tokenizes all query and document sequences and constructs the positive mask on CPU, returning GPU-ready token tensors. With `num_workers=8` and `prefetch_factor=2`, workers prepare upcoming batches while the GPU processes the current one. This eliminates the CPU-GPU serialization bottleneck entirely — the GPU never waits for the tokenizer.
+**GC-matched random.** Documents in the same GC-content decile as the query are scored randomly; others receive -inf. Tests whether retrieval metrics are inflated by GC-content confounds.
 
-**Vectorized MaxSim scoring.** The original scoring loop iterates over all query-document pairs in Python:
+### 4.2 Alignment-Free Sequence Baselines
 
-```python
-for q_idx in range(num_queries):       # 20 queries
-    for d_idx in range(num_docs):       # 140 docs
-        score = einsum("qf,df->qd", q[q_idx], d[d_idx])  # tiny kernel
-```
+**K-mer cosine (k=6).** 6-mer frequency vectors (4,096 dimensions) scored by cosine similarity. The standard "cheap but serious" baseline for DNA similarity.
 
-This launches 2,800 individual CUDA kernels per batch, each too small to saturate the GPU, with Python interpreter overhead between launches.
+**TF-IDF k-mer.** Same 6-mer vectors, but weighted by inverse document frequency across the corpus. Downweights common k-mers (poly-A runs) and upweights rare, potentially motif-relevant k-mers.
 
-We replace this with a single batched einsum that computes all pairwise token similarities in one fused operation:
+**MinHash k-mer Jaccard.** Approximate Jaccard similarity over k-mer sets using MinHash signatures (128 hash functions). Unlike cosine, this measures set overlap (presence/absence) rather than frequency similarity.
 
-```python
-sim = einsum("qif,djf->qidj", q_proj, d_proj)   # one large kernel
-max_sim = sim.max(dim=-1).values                  # vectorized max over doc tokens
-scores = (max_sim * q_mask[:, :, None]).sum(dim=1) # masked sum
-```
+**Gapped k-mer (gkm-SVM).** Enumerates gapped k-mers (k=10, l=6 informative positions, C(10,6)=210 patterns per window) that capture motif-like patterns with variable internal spacing — e.g., "GATA...GATA" with wildcard positions. Scored by cosine similarity in gapped k-mer feature space. This is a standard baseline in regulatory sequence analysis.
 
-This keeps the GPU busy on a single large matrix operation with no Python-loop overhead.
+### 4.3 Neural Baselines
 
-**Combined effect:** The two optimizations are complementary — the first ensures the GPU always has work queued, the second ensures each unit of work fully utilizes the GPU's compute capacity. Together they improved GPU utilization from ~16% to ~95%. Observed wall time is ~36 min/epoch (1,795 steps at ~1.18 s/step) plus ~5 min validation, giving ~7 hours for 10 epochs on 2× RTX 2080 Ti.
+**Pretrained DNABERT-2 (mean-pooled, no fine-tuning).** Raw pretrained DNABERT-2 (117M params) with mean-pooled token embeddings projected to 768-dim vectors, scored by cosine similarity. No task-specific training. Tests whether generic DNA language model representations already capture regulatory similarity.
 
-### 4.6 Training Configuration
+**Single-vector fine-tuned (mean-pooled).** Same DNABERT-2 backbone with LoRA, same contrastive training pairs and hyperparameters as ColBERT, but using mean-pooled cosine similarity instead of MaxSim. This is the **critical architectural baseline** — it isolates whether late interaction (token-level matching) adds value over single-vector compression. *(Training in progress.)*
 
-| Parameter | Debug (10k) | Small (50k) |
-|-----------|------------|-------------|
-| Epochs | 5 | 10 |
-| Batch size | 16 | 20 |
-| Gradient accumulation | 1 | 4 |
-| Learning rate | 1e-4 | 1e-4 |
-| Weight decay | 0.01 | 0.01 |
-| Max grad norm | 1.0 | 1.0 |
-| Negatives per query | 6 | 6 |
-| Temperature | 0.05 | 0.1 |
-| GPUs | 2x RTX 2080 Ti | 2x RTX 2080 Ti |
-| Precision | FP32 | FP32 |
+### 4.4 Upper Bound
 
-The DNABERT-2 backbone is wrapped in `DataParallel` across two GPUs, splitting the token encoding batch while keeping scoring and loss computation on the primary device.
+**Oracle (TF vector cosine).** Documents scored by cosine similarity on their true 2,818-dim TF binding vectors. No sequence information used. This is the theoretical ceiling — the best any method could do if it perfectly predicted TF binding from sequence.
 
-**Gradient accumulation.** With `grad_accum_steps=4`, weight updates are computed from the averaged gradients of 4 consecutive batches rather than a single batch. Each forward-backward pass processes 20 queries against 140 documents, but the optimizer only steps after accumulating gradients from 80 queries total. This stabilizes optimization: each weight update reflects a broader sample of the training distribution, reducing the noise from any single batch's random negative composition. In contrastive learning, where the learning signal depends entirely on which negatives happen to appear in the batch, this noise reduction is critical — without it, successive updates can push the model in conflicting directions, causing the loss to plateau at the random baseline (see Section 4.7).
+## 5. Results
 
-### 4.7 Training Dynamics
+### 5.1 Evaluation Setup
 
-**Random loss baseline.** With `batch_size=20` and `negatives_per_query=6`, each training batch contains 20 queries scored against 140 documents (20 positives + 120 negatives). For a model assigning uniform scores, the expected InfoNCE loss is:
+- **Queries:** 512 test-split cCREs (sampled from chr1/chr8/chr21)
+- **Corpus:** 2,048 test-split cCREs
+- **Relevance labels:** Positive pairs from the TF-enriched pair construction pipeline
+- **Activity vectors:** 2,818-dim TF binding vectors from ENCODE
 
-$$\mathcal{L}_\text{random} = \log(N_\text{docs}) = \log(140) \approx 4.95$$
+### 5.2 Retrieval Metrics
 
-This is the theoretical floor for a model with no discriminative ability — breaking below it means the model is reliably ranking at least some positives above their negatives.
+| Metric | Random | GC-matched | K-mer | TF-IDF K-mer | MinHash | gkm-SVM | Pretrained DNABERT-2 | Oracle |
+|--------|--------|------------|-------|-------------|---------|---------|---------------------|--------|
+| **MRR** | 0.0054 | 0.0055 | 0.0074 | 0.0062 | 0.0082 | 0.0063 | **0.0093** | 0.0317 |
+| **nDCG** | 0.0033 | 0.0038 | 0.0056 | 0.0058 | 0.0050 | 0.0058 | **0.0071** | 0.0261 |
+| Recall@5 | 0.0010 | 0.0005 | 0.0020 | 0.0015 | 0.0020 | 0.0015 | **0.0024** | 0.0073 |
+| Recall@10 | 0.0010 | 0.0020 | 0.0034 | 0.0024 | 0.0024 | 0.0024 | **0.0039** | 0.0176 |
+| Recall@50 | 0.0073 | 0.0088 | 0.0127 | 0.0146 | 0.0103 | 0.0151 | **0.0161** | 0.0562 |
 
-**Observed epoch 1 trajectory.** Training loss begins at ~37.5 at step 100, substantially above the random baseline. This is expected: at initialization, the random LoRA projection produces score distributions with high variance, and the aggressive temperature τ=0.05 amplifies any score gap between positive and the best negative in the batch. Even a small margin by which the positive is outscored translates to a large loss contribution. The loss decreases steadily throughout epoch 1 (reaching 6.76 average), with validation loss of 4.90 — just below the random baseline — and a validation MRR of 0.048.
+### 5.3 Biological Quality Metrics
 
-**Stagnation at epoch 2.** At the start of epoch 2, training loss drops sharply to ~4.91 and becomes nearly flat (±0.003 over 400 steps). The model has reached the random baseline but cannot escape it. The likely cause is the temperature: at τ=0.05, the softmax gradient with respect to the positive score is approximately:
+| Metric | Random | GC-matched | K-mer | TF-IDF K-mer | MinHash | gkm-SVM | Pretrained DNABERT-2 | Oracle |
+|--------|--------|------------|-------|-------------|---------|---------|---------------------|--------|
+| Class purity@10 | 0.687 | 0.590 | 0.621 | 0.624 | 0.624 | 0.622 | **0.645** | 0.637 |
+| Activity Jaccard@10 | 0.006 | 0.008 | 0.012 | 0.012 | 0.010 | 0.011 | 0.011 | **0.167** |
 
-$$\frac{\partial \mathcal{L}}{\partial s_\text{pos}} \approx \frac{1}{\tau}\left(p_\text{pos} - 1\right)$$
+### 5.4 Analysis
 
-Near the random baseline, $p_\text{pos} \approx 1/140 \approx 0.007$, so the gradient signal is $\approx -19.9/\tau$. At τ=0.05 this is large in magnitude — but the update is also opposed by equally large gradients from the 139 negatives. The result is that parameter updates oscillate rather than push the positive consistently higher, causing the loss to stall.
+**GC-matched random barely improves over random** (MRR 0.0055 vs 0.0054), confirming that our retrieval signal is not driven by GC-content confounds.
 
-A higher temperature (e.g., τ=0.1 or τ=0.2) softens the softmax distribution, producing more stable gradients and allowing the model to escape this plateau. This is a known issue with very low temperatures in contrastive training; they are beneficial once the model has already learned rough ordering but hinder early-stage learning.
+**Pretrained DNABERT-2 is the best sequence-based method**, beating all classical baselines without any task-specific training. MRR is 25% higher than k-mer cosine (0.0093 vs 0.0074) and 14% higher than MinHash (0.0093 vs 0.0082). This demonstrates that pretrained DNA language model representations capture regulatory patterns beyond what k-mer counting can express.
 
-**τ=0.1 results with 6-dim activity signal.** Increasing temperature to 0.1 eliminated the sharp stagnation but did not improve retrieval quality. Over 10 epochs, training loss decreased smoothly from 5.72 to 4.76, but validation MRR remained flat at ~0.05 (best: 0.051 at epoch 2), and validation loss began increasing after epoch 2 (4.90 → 5.03), indicating overfitting. The model learned to marginally rank same-class elements above cross-class ones but could not learn any within-class discrimination.
+**Classical baselines perform similarly to each other.** K-mer cosine (0.0074), TF-IDF k-mer (0.0062), MinHash (0.0082), and gkm-SVM (0.0063) all cluster in the MRR 0.006–0.008 range. Notably, gkm-SVM (designed for regulatory DNA) does not outperform simple k-mer cosine on this task, suggesting the gapped k-mer patterns don't capture additional TF-binding-relevant signal on this dataset.
 
-**Root cause: similarity signal, not architecture.** The 6-dim activity vector derived from class labels offered no information beyond class membership itself. With Jaccard ≥ 0.5 on 6 binary dimensions, nearly all same-class pairs qualify as positive, reducing the task to "distinguish classes by sequence" — which k-mer counting already solves. The model needs a richer signal to learn meaningful sequence-to-function mappings.
+**TF-IDF weighting does not help over raw k-mer cosine** (MRR 0.0062 vs 0.0074). IDF downweighting of common k-mers removes some of the composition signal that simple cosine exploits.
 
-**Resolution: TF binding enrichment.** We replaced the 6-dim class-derived vectors with 2,818-dim TF ChIP-seq binding profiles from ENCODE (see Section 3.5). This provides genuine within-class functional diversity: two distal enhancers bound by different TF programs are now correctly distinguished as negatives, and only elements sharing similar TF binding qualify as positives. Training with this enriched signal is ongoing.
+**The oracle ceiling is distant.** Oracle MRR (0.0317) is 3.4× the best sequence-based method, and oracle Activity Jaccard@10 (0.167) is 14× higher. This confirms there is substantial headroom — a perfect TF binding predictor would dramatically improve retrieval — but also indicates the sequence → TF binding mapping is inherently lossy.
 
-## 5. Baselines
+**All methods show low absolute performance.** Recall@50 below 2% for all sequence methods reflects the fundamental sparsity of the TF binding labels: most same-class pairs share zero TFs, making the relevance labels extremely sparse relative to corpus size.
 
-### 5.1 Random Baseline
+### 5.5 Training Dynamics Observations
 
-Documents are scored with uniform random values. This establishes the floor for all metrics.
+We attempted fine-tuning with contrastive learning (InfoNCE loss) under several configurations:
 
-### 5.2 K-mer Baseline (k=6)
+| Configuration | Result |
+|--------------|--------|
+| τ = 0.05, grad_accum = 1, 6-dim activity | Loss stagnates at random baseline (~4.9) after epoch 1 |
+| τ = 0.1, grad_accum = 1, 6-dim activity | Loss decreases smoothly but val MRR flat at ~0.05 across 10 epochs |
+| τ = 0.1, grad_accum = 1, TF 2818-dim | Same stagnation pattern — epoch 2 flattens at ~4.88 |
+| τ = 0.1, grad_accum = 4, TF 2818-dim | Train loss breaks through to 1.68, but val loss stays at 4.90 (overfitting) |
 
-For each query-document pair, we compute k-mer frequency vectors (k=6, yielding 4^6 = 4,096 possible 6-mers) and score by cosine similarity. This is a strong lexical baseline that captures local sequence composition without any learned parameters.
+The consistent pattern: the model learns to memorize training pairs (train loss drops well below random) but fails to generalize to held-out data. This overfitting suggests the TF binding signal is too sparse and noisy to provide clean supervision for sequence-level representation learning on this dataset.
 
-### 5.3 Mean-Pooled Baseline
+## 6. Future Plans
 
-(Planned) Uses the same DNABERT-2 backbone but replaces ColBERT's token-level MaxSim with mean-pooled sequence embeddings scored by cosine similarity. This isolates the contribution of late interaction versus single-vector representations.
+### 6.1 Switch to DeepSEA Dataset
 
-## 6. Evaluation
+The primary limitation of our current approach is the similarity signal, not the model architecture. The ENCODE TF binding matrix is sparse (median 7 of 2,818 experiments per cCRE), experimentally biased (coverage depends on which cell lines were assayed), and weakly correlated with sequence features (r = 0.21).
 
-### 6.1 Metrics
+The **DeepSEA** dataset provides a cleaner alternative:
+- **919 binary chromatin features** per 1kb genomic sequence (TF binding, DNase hypersensitivity, histone marks across cell types)
+- **Labels derived from uniform genome-wide assays** rather than heterogeneous experiment-specific peaks
+- **Established benchmark** with known baselines, enabling direct comparison with published methods
+- **Denser labels** — each sequence has predictions across all 919 features, eliminating the sparsity problem
 
-**Retrieval metrics** (computed against labeled positive pairs from the test split):
-- Recall@k (k = 1, 5, 10, 50)
-- Mean Reciprocal Rank (MRR)
-- Normalized Discounted Cumulative Gain (nDCG)
+With DeepSEA labels, we can define similarity as cosine similarity over the 919-dim chromatin feature vector — a much denser and more uniform signal than TF binding Jaccard.
 
-**Biological metrics** (computed over the top-k retrieved documents):
-- **Class purity@k**: Fraction of retrieved documents sharing the query's regulatory class
-- **Activity Jaccard@k**: Mean Jaccard similarity of activity vectors between query and retrieved documents
-- **Activity correlation@k**: Mean Pearson correlation of activity vectors
+### 6.2 Regulatory Program Discovery
 
-### 6.2 Preliminary Results (Debug, 10k cCREs)
+Rather than using raw pairwise similarity, we plan to discover latent regulatory programs via NMF or k-means clustering on the chromatin feature matrix. Each cluster represents a co-occurring set of regulatory marks (e.g., an erythroid program, a neural program). The retrieval task then becomes: given a query sequence, retrieve elements belonging to the same regulatory program. This provides:
+- Cleaner positive/negative labels (same program vs different program)
+- Biologically interpretable clusters
+- A testable claim: "sequence alone predicts regulatory program membership"
 
-Evaluation on 256 test queries against a corpus of 1,024 test-split cCREs:
+### 6.3 Architecture Improvements
 
-| Metric | ColBERT (ours) | K-mer (k=6) | Random |
-|--------|---------------|-------------|--------|
-| Recall@1 | 0.0020 | 0.0010 | 0.0010 |
-| Recall@5 | 0.0039 | 0.0068 | 0.0049 |
-| Recall@10 | 0.0117 | 0.0127 | 0.0049 |
-| Recall@50 | 0.0312 | 0.0391 | 0.0264 |
-| MRR | 0.0217 | 0.0238 | 0.0160 |
-| nDCG | 0.0149 | 0.0178 | 0.0113 |
-| **Class purity@5** | **0.630** | 0.568 | 0.488 |
-| **Class purity@10** | **0.627** | 0.589 | 0.561 |
-| **Class purity@50** | **0.625** | — | — |
+- **ColBERT vs mean-pooled comparison.** Our pretrained baseline used mean pooling. A direct comparison between ColBERT (MaxSim) and mean-pooled scoring on the same fine-tuned backbone would isolate the contribution of late interaction.
+- **Hard negative mining.** Instead of random in-batch negatives, mine hard negatives from the top-k nearest neighbors in embedding space. This forces the model to learn finer distinctions.
+- **Curriculum training.** Start with easy class-level discrimination, then progressively introduce harder within-class pairs as the model improves.
 
-**Key observations**:
+### 6.4 Scaling
 
-- The ColBERT model achieves the highest class purity across all k values, indicating it retrieves regulatory elements of the correct class more consistently than either baseline. At k=5, the model retrieves same-class elements 63% of the time vs. 57% for k-mer and 49% for random.
-
-- Recall/MRR/nDCG numbers are low across all methods. This is expected: with only 1,024 corpus documents and a small number of labeled positives per query (up to 4), most true positives are simply absent from the sampled corpus.
-
-- The k-mer baseline is competitive on retrieval metrics (MRR 0.024 vs. model 0.022), reflecting the fact that same-class cCREs often share sequence motifs detectable by k-gram matching. However, k-mer's lower class purity suggests it also retrieves lexically similar but functionally different elements.
-
-- These are preliminary results from the 10k debug subset with 5 training epochs. Scaling to 50k (10 epochs) and 200k cCREs is expected to improve the learned model disproportionately, as the pretrained DNABERT-2 representations benefit more from additional training signal than the parameter-free k-mer baseline.
-
-## 7. Discussion
-
-*Results from 50k and 200k training runs pending.*
-
-## References
-
-- Khattab, O. & Zaharia, M. (2020). ColBERT: Efficient and effective passage search via contextualized late interaction over BERT. SIGIR.
-- Zhou, Z. et al. (2024). DNABERT-2: Efficient foundation model and benchmark for multi-species genome. ICLR.
-- ENCODE Project Consortium (2020). Expanded encyclopaedias of DNA elements in the human and mouse genomes. Nature.
-- ENCODE SCREEN Registry V3. https://screen.encodeproject.org/
-- Hu, E. et al. (2022). LoRA: Low-rank adaptation of large language models. ICLR.
+- Expand from 50k to the full 1M+ cCRE corpus
+- FAISS-based approximate nearest neighbor search for efficient retrieval at scale
+- Evaluate on biologically motivated queries (e.g., "find all enhancers with a similar regulatory profile to this known disease-associated variant")

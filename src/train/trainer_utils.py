@@ -133,7 +133,7 @@ def build_retriever(model_cfg: dict[str, Any]) -> torch.nn.Module:
     backbone_cfg = {key: value for key, value in model_cfg.items() if key in backbone_keys}
     backbone = build_backbone(backbone_cfg)
     if model_type == "meanpool":
-        return MeanPoolRetriever(backbone)
+        return MeanPoolRetriever(backbone, projection_dim=int(model_cfg.get("projection_dim", 64)))
     if model_type == "colbert":
         return ColBERTRetriever(backbone, projection_dim=int(model_cfg.get("projection_dim", 64)))
     raise ValueError(f"Unsupported model_type={model_type}")

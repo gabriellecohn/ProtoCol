@@ -1,0 +1,11 @@
+model_type: meanpool
+model_name: zhihan1996/DNABERT-2-117M
+max_length: 512
+projection_dim: 64
+score_temperature: 0.1
+gradient_checkpointing: false
+use_lora: true
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.1
+trust_remote_code: true

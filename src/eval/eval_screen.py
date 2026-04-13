@@ -133,8 +133,9 @@ def main() -> None:
         tf_ccre_ids = tf_data["ccre_ids"]
         tf_matrix = tf_data["tf_matrix"]
         tf_lookup = {cid: i for i, cid in enumerate(tf_ccre_ids)}
+        n_tfs = tf_matrix.shape[1]
         activity_lookup = {
-            cid: tf_matrix[tf_lookup[cid]].astype(float).tolist() if cid in tf_lookup else []
+            cid: tf_matrix[tf_lookup[cid]].astype(float).tolist() if cid in tf_lookup else [0.0] * n_tfs
             for cid in manifest["ccre_id"]
         }
     else:
