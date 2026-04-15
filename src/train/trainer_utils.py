@@ -38,7 +38,9 @@ class GroupedPairDataset(Dataset):
         self.sequence_column = sequence_column
         self.negatives_per_query = negatives_per_query
         self.seed = seed
-        sequence_lookup = manifest_df.set_index("ccre_id")[sequence_column].dropna().to_dict()
+        # Auto-detect ID column
+        id_col = "ccre_id" if "ccre_id" in manifest_df.columns else "domain_id"
+        sequence_lookup = manifest_df.set_index(id_col)[sequence_column].dropna().to_dict()
         groups: list[QueryGroup] = []
 
         split_pairs = pair_df[pair_df["split"] == split]

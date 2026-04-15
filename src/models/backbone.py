@@ -32,6 +32,7 @@ class BackboneConfig:
     lora_alpha: int = 32
     lora_dropout: float = 0.1
     trust_remote_code: bool = True
+    lora_target_modules: list[str] | None = None  # auto-detect or explicit
 
 
 class SimpleDNABackbone(nn.Module):
@@ -78,29 +79,27 @@ class DNAEncoderBackbone(nn.Module):
             return
 
         if AutoModel is None or AutoTokenizer is None:
-            raise ImportError("transformers is required for DNABERT-2 backbones")
+            raise ImportError("transformers is required for pretrained backbones")
 
         from transformers import AutoConfig
-        from transformers.dynamic_module_utils import get_class_from_dynamic_module
         self.tokenizer = AutoTokenizer.from_pretrained(
             config.model_name,
             trust_remote_code=config.trust_remote_code,
-            use_fast=False,
         )
         hf_config = AutoConfig.from_pretrained(
             config.model_name,
             trust_remote_code=config.trust_remote_code,
         )
+
+        # DNABERT-2 requires special loading (custom model class + Triton fix)
         auto_map = getattr(hf_config, "auto_map", {})
         model_class_ref = auto_map.get("AutoModel")
         if model_class_ref and config.trust_remote_code:
+            from transformers.dynamic_module_utils import get_class_from_dynamic_module
             model_class = get_class_from_dynamic_module(
                 model_class_ref,
                 config.model_name,
             )
-            # Disable bundled Triton flash attention — the kernel uses the old
-            # tl.dot(trans_b=True) API which was removed in newer Triton versions.
-            # bert_layers.py falls back to standard attention when this is None.
             import sys
             for _mod in sys.modules.values():
                 if hasattr(_mod, "flash_attn_qkvpacked_func"):
@@ -111,22 +110,33 @@ class DNAEncoderBackbone(nn.Module):
                 config=hf_config,
             )
         else:
+            # Standard HuggingFace model (ESM-2, BERT, etc.)
             self.model = AutoModel.from_pretrained(
                 config.model_name,
                 config=hf_config,
                 trust_remote_code=config.trust_remote_code,
             )
         self.hidden_size = int(self.model.config.hidden_size)
+
+        # LoRA fine-tuning
         if config.use_lora and get_peft_model is not None and LoraConfig is not None:
-            # DNABERT-2 uses a fused Wqkv projection; auto-detection fails for
-            # custom model classes so we name the target modules explicitly.
+            # Use explicit targets if provided, otherwise auto-detect
+            target_modules = config.lora_target_modules
+            if target_modules is None:
+                # Default targets per model family
+                if "DNABERT" in config.model_name or "dnabert" in config.model_name.lower():
+                    target_modules = ["Wqkv", "dense"]
+                elif "esm" in config.model_name.lower():
+                    target_modules = ["query", "value"]
+                else:
+                    target_modules = ["query", "value"]  # standard BERT default
             lora_cfg = LoraConfig(
                 task_type=TaskType.FEATURE_EXTRACTION,
                 r=config.lora_rank,
                 lora_alpha=config.lora_alpha,
                 lora_dropout=config.lora_dropout,
                 bias="none",
-                target_modules=["Wqkv", "dense"],
+                target_modules=target_modules,
             )
             self.model = get_peft_model(self.model, lora_cfg)
         if config.gradient_checkpointing and hasattr(self.model, "gradient_checkpointing_enable"):
