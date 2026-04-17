@@ -1,0 +1,22 @@
+seed: 42
+device: cuda:0
+output_dir: outputs/pfam_colbert
+data:
+  manifest_path: data/interim/manifests/pfam_manifest.csv
+  pair_path: data/processed/pfam/pfam_pairs.csv
+  sequence_column: sequence
+  negatives_per_query: 6
+model:
+  config_path: configs/model/esm2_colbert.yaml
+training:
+  epochs: 5
+  batch_size: 12
+  grad_accum_steps: 4
+  gpu_ids: [0, 1]
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  num_workers: 8
+  bf16: false
+  max_grad_norm: 1.0
+  log_interval: 100
+  save_name: pfam_colbert_best.pt

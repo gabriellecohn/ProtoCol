@@ -38,8 +38,13 @@ class GroupedPairDataset(Dataset):
         self.sequence_column = sequence_column
         self.negatives_per_query = negatives_per_query
         self.seed = seed
-        # Auto-detect ID column
-        id_col = "ccre_id" if "ccre_id" in manifest_df.columns else "domain_id"
+        # Auto-detect ID column (supports DNA cCRE, SCOPe domain, Pfam sequence)
+        for candidate in ("ccre_id", "domain_id", "sequence_id"):
+            if candidate in manifest_df.columns:
+                id_col = candidate
+                break
+        else:
+            raise ValueError(f"Manifest has no known ID column: {manifest_df.columns.tolist()}")
         sequence_lookup = manifest_df.set_index(id_col)[sequence_column].dropna().to_dict()
         groups: list[QueryGroup] = []
 
