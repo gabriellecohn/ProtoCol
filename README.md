@@ -120,6 +120,30 @@ CUDA_VISIBLE_DEVICES=0,1 python -m src.train.train_stage_a \
 
 This is the critical architectural comparison — identical training setup but replaces ColBERT's MaxSim scoring with mean-pooled cosine similarity.
 
+### Layerwise fine-tuning (last-N unfrozen, no LoRA)
+
+As an alternative to LoRA, freeze the ESM-2 embeddings and early transformer layers, leaving only the last N layers trainable. This allows full-rank updates to the highest-level representations while keeping the pretrained low-level features intact.
+
+```bash
+tmux new-session -d -s train \
+  "PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0,1 \
+   python -m src.train.train_stage_a --config configs/train/stage_a_pfam_unfrozen.yaml \
+   2>&1 | tee outputs/pfam_unfrozen_train.log"
+```
+
+**Layerwise training config** (`configs/train/stage_a_pfam_unfrozen.yaml`):
+- ESM-2 650M backbone with **last 4 of 33 transformer layers unfrozen** (~80M trainable params vs ~2M for LoRA rank 16)
+- Embeddings and layers 1–29 are frozen — preserves pretrained low-level protein features
+- Batch size 4 × grad accumulation 12 = effective batch of 48 queries (reduced due to higher memory footprint of optimizer state)
+- Learning rate 5e-5 (lower than LoRA's 1e-4) to avoid catastrophic forgetting in full-rank updates
+- Gradient checkpointing enabled
+
+**How it works:** `src/models/backbone.py` supports `num_unfrozen_layers` in `BackboneConfig`. When set (and `use_lora: false`), all backbone parameters are frozen except the last N transformer layers. The ColBERT projection head is always trainable since it's a new layer added on top.
+
+**When to use LoRA vs layerwise:**
+- **LoRA** — fewer parameters, faster training, less GPU memory, lower risk of catastrophic forgetting
+- **Layerwise** — full-rank updates, simpler mental model, no peft dependency, may adapt better on large in-distribution datasets
+
 ## Project Overview
 
 **Task:** Given only a raw amino acid sequence, retrieve protein domains in the same family or superfamily.

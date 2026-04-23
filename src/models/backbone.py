@@ -33,6 +33,8 @@ class BackboneConfig:
     lora_dropout: float = 0.1
     trust_remote_code: bool = True
     lora_target_modules: list[str] | None = None  # auto-detect or explicit
+    # Alternative to LoRA: freeze backbone except last N transformer layers
+    num_unfrozen_layers: int | None = None  # None = no freezing; int = unfreeze last N
 
 
 class SimpleDNABackbone(nn.Module):
@@ -118,18 +120,17 @@ class DNAEncoderBackbone(nn.Module):
             )
         self.hidden_size = int(self.model.config.hidden_size)
 
-        # LoRA fine-tuning
+        # Fine-tuning strategy: LoRA or freeze-all-but-last-N
         if config.use_lora and get_peft_model is not None and LoraConfig is not None:
             # Use explicit targets if provided, otherwise auto-detect
             target_modules = config.lora_target_modules
             if target_modules is None:
-                # Default targets per model family
                 if "DNABERT" in config.model_name or "dnabert" in config.model_name.lower():
                     target_modules = ["Wqkv", "dense"]
                 elif "esm" in config.model_name.lower():
                     target_modules = ["query", "value"]
                 else:
-                    target_modules = ["query", "value"]  # standard BERT default
+                    target_modules = ["query", "value"]
             lora_cfg = LoraConfig(
                 task_type=TaskType.FEATURE_EXTRACTION,
                 r=config.lora_rank,
@@ -139,8 +140,53 @@ class DNAEncoderBackbone(nn.Module):
                 target_modules=target_modules,
             )
             self.model = get_peft_model(self.model, lora_cfg)
+        elif config.num_unfrozen_layers is not None:
+            self._freeze_except_last_n(config.num_unfrozen_layers)
+
         if config.gradient_checkpointing and hasattr(self.model, "gradient_checkpointing_enable"):
             self.model.gradient_checkpointing_enable()
+            # Required when some params are frozen: embeddings need a hook to
+            # force their outputs to have requires_grad=True so checkpointed
+            # layers get a proper gradient path.
+            if hasattr(self.model, "enable_input_require_grads"):
+                self.model.enable_input_require_grads()
+
+    def _freeze_except_last_n(self, n: int) -> None:
+        """Freeze all backbone parameters except the last n transformer layers."""
+        # Freeze everything first
+        for param in self.model.parameters():
+            param.requires_grad = False
+
+        # Find the transformer layer list (ESM-2 / BERT / DNABERT-2 all use encoder.layer)
+        layers = None
+        for candidate in (
+            getattr(getattr(self.model, "encoder", None), "layer", None),
+            getattr(getattr(getattr(self.model, "esm", None), "encoder", None), "layer", None),
+            getattr(getattr(getattr(self.model, "bert", None), "encoder", None), "layer", None),
+        ):
+            if candidate is not None:
+                layers = candidate
+                break
+        if layers is None:
+            raise ValueError(
+                f"Could not find transformer layers in model {type(self.model).__name__}; "
+                "unfreezing requires a standard encoder.layer list."
+            )
+
+        n_layers = len(layers)
+        start = max(0, n_layers - n)
+        n_trainable = 0
+        for i in range(start, n_layers):
+            for param in layers[i].parameters():
+                param.requires_grad = True
+                n_trainable += param.numel()
+
+        total = sum(p.numel() for p in self.model.parameters())
+        import logging
+        logging.getLogger(__name__).info(
+            "Unfroze last %d of %d transformer layers: %.1fM / %.1fM params trainable (%.1f%%)",
+            n, n_layers, n_trainable / 1e6, total / 1e6, 100 * n_trainable / total,
+        )
 
     def tokenize(self, sequences: list[str]) -> dict[str, torch.Tensor]:
         """Tokenize sequences on CPU (no GPU transfer)."""

@@ -1,0 +1,9 @@
+model_type: colbert
+model_name: facebook/esm2_t33_650M_UR50D
+max_length: 1022
+projection_dim: 64
+score_temperature: 0.1
+gradient_checkpointing: true
+use_lora: false
+num_unfrozen_layers: 4   # unfreeze last 4 of 33 transformer layers (~80M trainable params)
+trust_remote_code: false
