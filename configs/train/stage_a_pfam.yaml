@@ -10,8 +10,8 @@ model:
   config_path: configs/model/esm2_colbert.yaml
 training:
   epochs: 5
-  batch_size: 12
-  grad_accum_steps: 4
+  batch_size: 6
+  grad_accum_steps: 8
   gpu_ids: [0, 1]
   learning_rate: 1.0e-4
   weight_decay: 0.01
