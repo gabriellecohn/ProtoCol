@@ -1,13 +1,13 @@
 model_type: meanpool
 model_name: facebook/esm2_t33_650M_UR50D
-max_length: 1022
+max_length: 512
 projection_dim: 64
-score_temperature: 0.1
-gradient_checkpointing: false
+score_temperature: 0.3
+gradient_checkpointing: true
 use_lora: true
-lora_rank: 16
-lora_alpha: 32
-lora_dropout: 0.1
+lora_rank: 8
+lora_alpha: 16
+lora_dropout: 0.2
 trust_remote_code: false
 lora_target_modules:
   - query

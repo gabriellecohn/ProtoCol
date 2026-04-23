@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
+import time
 from pathlib import Path
 
 import pandas as pd
 import torch
+import torch.distributed as dist
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
@@ -42,6 +46,7 @@ def build_docs(batch: dict[str, list[object]]) -> tuple[list[str], torch.Tensor]
 
 
 def evaluate_model(model: torch.nn.Module, loader: DataLoader, temperature: float) -> dict[str, float]:
+    was_training = model.training
     model.eval()
     losses = []
     reciprocal_ranks = []
@@ -55,10 +60,33 @@ def evaluate_model(model: torch.nn.Module, loader: DataLoader, temperature: floa
                 target_score = scores[row_idx, row_idx].item()
                 rank = int((scores[row_idx] > target_score).sum().item()) + 1
                 reciprocal_ranks.append(1.0 / rank)
+    if was_training:
+        model.train()
     return {
         "loss": float(sum(losses) / max(len(losses), 1)),
         "mrr": float(sum(reciprocal_ranks) / max(len(reciprocal_ranks), 1)),
     }
+
+
+def _resolve_run_id(is_ddp: bool, is_main: bool) -> str:
+    if is_ddp:
+        obj = [time.strftime("%Y%m%d_%H%M%S") if is_main else None]
+        dist.broadcast_object_list(obj, src=0)
+        return obj[0]
+    return time.strftime("%Y%m%d_%H%M%S")
+
+
+def _log_event(log_path: Path, event: dict[str, object]) -> None:
+    with log_path.open("a") as fh:
+        fh.write(json.dumps(event) + "\n")
+
+
+def _should_stop(stop: bool, is_ddp: bool) -> bool:
+    if not is_ddp:
+        return stop
+    flag = torch.tensor([1 if stop else 0], dtype=torch.int32, device="cuda")
+    dist.broadcast(flag, src=0)
+    return bool(flag.item())
 
 
 def main() -> None:
@@ -67,10 +95,21 @@ def main() -> None:
     parser.add_argument("--resume", default=None, help="Path to checkpoint to resume training from")
     args = parser.parse_args()
 
+    # DDP detection — if LOCAL_RANK is set, we're under torchrun
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    is_ddp = local_rank >= 0
+    if is_ddp:
+        dist.init_process_group(backend="nccl")
+        torch.cuda.set_device(local_rank)
+    is_main = (not is_ddp) or dist.get_rank() == 0
+
     train_cfg, model_cfg = load_training_bundle(args.config)
     set_global_seed(int(train_cfg["seed"]))
 
-    device = resolve_device(str(train_cfg.get("device", "cpu")))
+    if is_ddp:
+        device = f"cuda:{local_rank}"
+    else:
+        device = resolve_device(str(train_cfg.get("device", "cpu")))
     manifest_df = pd.read_csv(train_cfg["data"]["manifest_path"])
     pair_df = pd.read_csv(train_cfg["data"]["pair_path"])
     sequence_column = train_cfg["data"]["sequence_column"]
@@ -120,7 +159,7 @@ def main() -> None:
         prefetch_factor=2,
     )
     gpu_ids = train_cfg["training"].get("gpu_ids")
-    if gpu_ids and len(gpu_ids) > 1 and hasattr(model, "backbone"):
+    if not is_ddp and gpu_ids and len(gpu_ids) > 1 and hasattr(model, "backbone"):
         LOGGER.info("Wrapping backbone encoder in DataParallel across GPUs %s", gpu_ids)
         model.backbone.model = torch.nn.DataParallel(model.backbone.model, device_ids=gpu_ids)
     optimizer = AdamW(
@@ -134,15 +173,24 @@ def main() -> None:
     temperature = float(model_cfg.get("score_temperature", 0.02))
     best_mrr = float("-inf")
     start_epoch = 0
-    output_dir = Path(train_cfg.get("output_dir", "outputs"))
+
+    # Timestamped per-run output dir: rank 0 picks the stamp, all ranks use it.
+    run_id = _resolve_run_id(is_ddp, is_main)
+    base_output_dir = Path(train_cfg.get("output_dir", "outputs"))
+    output_dir = base_output_dir / run_id
     checkpoint_path = output_dir / "checkpoints" / train_cfg["training"]["save_name"]
     latest_path = output_dir / "checkpoints" / "latest.pt"
-    metrics_path = output_dir / "metrics" / "train_stage_a_summary.json"
-    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    metrics_dir = output_dir / "metrics"
+    metrics_path = metrics_dir / "train_stage_a_summary.json"
+    jsonl_log_path = metrics_dir / "train_log.jsonl"
+    if is_main:
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        metrics_dir.mkdir(parents=True, exist_ok=True)
+        LOGGER.info("Run output directory: %s", output_dir)
 
-    # Resume from checkpoint
-    resume_path = args.resume or (str(latest_path) if latest_path.exists() else None)
+    # Resume from explicit --resume only. Auto-resume from latest.pt is removed
+    # because each run writes to a fresh timestamped subdir.
+    resume_path = args.resume
     if resume_path and Path(resume_path).exists():
         LOGGER.info("Resuming from checkpoint %s", resume_path)
         ckpt = torch.load(resume_path, map_location=device)
@@ -156,7 +204,61 @@ def main() -> None:
     global_step = 0
     grad_accum_steps = int(train_cfg["training"]["grad_accum_steps"])
     log_interval = int(train_cfg["training"].get("log_interval", 100))
+    eval_interval_steps = int(train_cfg["training"].get("eval_interval_steps", 0))
+    early_stop_patience = int(train_cfg["training"].get("early_stop_patience", 0))
+    patience_counter = 0
+    stop_training = False
+    wall_start = time.time()
+    last_log_time = wall_start
+
+    def _run_validation(epoch_1: int, epoch_step: int) -> None:
+        nonlocal best_mrr, patience_counter, stop_training
+        val_metrics = evaluate_model(model, val_loader, temperature=temperature)
+        if is_main:
+            LOGGER.info(
+                "[val] epoch=%d step=%d val_loss=%.4f val_mrr=%.4f",
+                epoch_1, epoch_step, val_metrics["loss"], val_metrics["mrr"],
+            )
+            _log_event(jsonl_log_path, {
+                "type": "val",
+                "epoch": epoch_1,
+                "global_step": global_step,
+                "epoch_step": epoch_step,
+                "val_loss": val_metrics["loss"],
+                "val_mrr": val_metrics["mrr"],
+                "wall_time": time.time() - wall_start,
+            })
+        if val_metrics["mrr"] > best_mrr:
+            best_mrr = val_metrics["mrr"]
+            patience_counter = 0
+            if is_main:
+                save_state = {
+                    k.replace("backbone.model.module.", "backbone.model."): v
+                    for k, v in model.state_dict().items()
+                }
+                torch.save(
+                    {
+                        "model_state": save_state,
+                        "model_config": model_cfg,
+                        "train_config": train_cfg,
+                        "best_val_mrr": best_mrr,
+                    },
+                    checkpoint_path,
+                )
+                LOGGER.info("New best MRR=%.4f, saved to %s", best_mrr, checkpoint_path)
+        else:
+            patience_counter += 1
+            if early_stop_patience > 0 and patience_counter >= early_stop_patience:
+                stop_training = True
+                if is_main:
+                    LOGGER.info(
+                        "Early stopping: val MRR did not improve for %d consecutive evals",
+                        early_stop_patience,
+                    )
+
     for epoch in range(start_epoch, int(train_cfg["training"]["epochs"])):
+        epoch_1 = epoch + 1
+        epoch_start = time.time()
         model.train()
         optimizer.zero_grad(set_to_none=True)
         running_loss = 0.0
@@ -175,58 +277,109 @@ def main() -> None:
             global_step += 1
             epoch_step += 1
 
+            did_opt_step = False
             if global_step % grad_accum_steps == 0:
                 clip_grad_norm_(model.parameters(), float(train_cfg["training"]["max_grad_norm"]))
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+                did_opt_step = True
 
             if epoch_step % log_interval == 0:
+                now = time.time()
+                secs_per_step = (now - last_log_time) / max(log_interval, 1)
+                last_log_time = now
                 avg_loss = running_loss / epoch_step
-                LOGGER.info(
-                    "epoch=%d step=%d/%d loss=%.4f",
-                    epoch + 1, epoch_step, num_batches, avg_loss,
-                )
+                if is_main:
+                    LOGGER.info(
+                        "epoch=%d step=%d/%d loss=%.4f sec/step=%.3f",
+                        epoch_1, epoch_step, num_batches, avg_loss, secs_per_step,
+                    )
+                    _log_event(jsonl_log_path, {
+                        "type": "train",
+                        "epoch": epoch_1,
+                        "global_step": global_step,
+                        "epoch_step": epoch_step,
+                        "loss": avg_loss,
+                        "secs_per_step": secs_per_step,
+                        "wall_time": now - wall_start,
+                    })
 
+            # Mid-epoch validation on optimizer-step boundaries
+            if did_opt_step and eval_interval_steps > 0:
+                opt_steps = global_step // grad_accum_steps
+                if opt_steps % eval_interval_steps == 0:
+                    _run_validation(epoch_1, epoch_step)
+                    if _should_stop(stop_training, is_ddp):
+                        break
+
+        if _should_stop(stop_training, is_ddp):
+            break
+
+        # End-of-epoch validation
         val_metrics = evaluate_model(model, val_loader, temperature=temperature)
-        LOGGER.info(
-            "epoch=%d train_loss=%.4f val_loss=%.4f val_mrr=%.4f",
-            epoch + 1,
-            running_loss / max(len(train_loader), 1),
-            val_metrics["loss"],
-            val_metrics["mrr"],
-        )
-        # Unwrap DataParallel for portable checkpoints
-        save_state = {
-            k.replace("backbone.model.module.", "backbone.model."): v
-            for k, v in model.state_dict().items()
-        }
-        # Save latest checkpoint every epoch (for resume)
-        torch.save(
-            {
-                "model_state": save_state,
-                "model_config": model_cfg,
-                "train_config": train_cfg,
-                "optimizer_state": optimizer.state_dict(),
-                "epoch": epoch + 1,
-                "best_val_mrr": best_mrr,
-            },
-            latest_path,
-        )
-        if val_metrics["mrr"] > best_mrr:
-            best_mrr = val_metrics["mrr"]
+        train_loss = running_loss / max(len(train_loader), 1)
+        epoch_mins = (time.time() - epoch_start) / 60.0
+        if is_main:
+            LOGGER.info(
+                "epoch=%d train_loss=%.4f val_loss=%.4f val_mrr=%.4f (%.1f min)",
+                epoch_1, train_loss, val_metrics["loss"], val_metrics["mrr"], epoch_mins,
+            )
+            _log_event(jsonl_log_path, {
+                "type": "epoch_end",
+                "epoch": epoch_1,
+                "global_step": global_step,
+                "train_loss": train_loss,
+                "val_loss": val_metrics["loss"],
+                "val_mrr": val_metrics["mrr"],
+                "epoch_mins": epoch_mins,
+                "wall_time": time.time() - wall_start,
+            })
+        # Save latest.pt (for explicit resume)
+        if is_main:
+            save_state = {
+                k.replace("backbone.model.module.", "backbone.model."): v
+                for k, v in model.state_dict().items()
+            }
             torch.save(
                 {
                     "model_state": save_state,
                     "model_config": model_cfg,
                     "train_config": train_cfg,
+                    "optimizer_state": optimizer.state_dict(),
+                    "epoch": epoch_1,
                     "best_val_mrr": best_mrr,
                 },
-                checkpoint_path,
+                latest_path,
             )
-            LOGGER.info("New best MRR=%.4f, saved to %s", best_mrr, checkpoint_path)
+        # Update best/patience based on end-of-epoch eval too
+        if val_metrics["mrr"] > best_mrr:
+            best_mrr = val_metrics["mrr"]
+            patience_counter = 0
+            if is_main:
+                torch.save(
+                    {
+                        "model_state": save_state,
+                        "model_config": model_cfg,
+                        "train_config": train_cfg,
+                        "best_val_mrr": best_mrr,
+                    },
+                    checkpoint_path,
+                )
+                LOGGER.info("New best MRR=%.4f, saved to %s", best_mrr, checkpoint_path)
+        else:
+            patience_counter += 1
+            if early_stop_patience > 0 and patience_counter >= early_stop_patience:
+                stop_training = True
 
-    dump_json({"best_val_mrr": best_mrr, "checkpoint": str(checkpoint_path)}, metrics_path)
-    LOGGER.info("Saved best checkpoint to %s", checkpoint_path)
+        if _should_stop(stop_training, is_ddp):
+            break
+
+    if is_main:
+        dump_json({"best_val_mrr": best_mrr, "checkpoint": str(checkpoint_path)}, metrics_path)
+        LOGGER.info("Saved best checkpoint to %s", checkpoint_path)
+
+    if is_ddp:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

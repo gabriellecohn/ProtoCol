@@ -144,12 +144,14 @@ class DNAEncoderBackbone(nn.Module):
             self._freeze_except_last_n(config.num_unfrozen_layers)
 
         if config.gradient_checkpointing and hasattr(self.model, "gradient_checkpointing_enable"):
-            self.model.gradient_checkpointing_enable()
-            # Required when some params are frozen: embeddings need a hook to
-            # force their outputs to have requires_grad=True so checkpointed
-            # layers get a proper gradient path.
+            # Must force input grads BEFORE enabling checkpointing: with LoRA
+            # (or any frozen base), the embedding output has requires_grad=False,
+            # so torch.utils.checkpoint short-circuits and GC silently no-ops.
             if hasattr(self.model, "enable_input_require_grads"):
                 self.model.enable_input_require_grads()
+            self.model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
 
     def _freeze_except_last_n(self, n: int) -> None:
         """Freeze all backbone parameters except the last n transformer layers."""
