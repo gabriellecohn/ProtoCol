@@ -132,8 +132,8 @@ tmux new-session -d -s train \
 ```
 
 **Layerwise training config** (`configs/train/stage_a_pfam_unfrozen.yaml`):
-- ESM-2 650M backbone with **last 4 of 33 transformer layers unfrozen** (~80M trainable params vs ~2M for LoRA rank 16)
-- Embeddings and layers 1–29 are frozen — preserves pretrained low-level protein features
+- ESM-2 650M backbone with **last 3 of 33 transformer layers unfrozen** (~60M trainable params vs ~2M for LoRA rank 16)
+- Embeddings and layers 1–30 are frozen — preserves pretrained low-level protein features
 - Batch size 4 × grad accumulation 12 = effective batch of 48 queries (reduced due to higher memory footprint of optimizer state)
 - Learning rate 5e-5 (lower than LoRA's 1e-4) to avoid catastrophic forgetting in full-rank updates
 - Gradient checkpointing enabled
