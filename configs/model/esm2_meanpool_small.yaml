@@ -1,4 +1,4 @@
-model_type: colbert
+model_type: meanpool
 model_name: facebook/esm2_t12_35M_UR50D
 max_length: 512
 projection_dim: 64

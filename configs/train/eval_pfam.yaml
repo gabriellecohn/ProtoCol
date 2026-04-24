@@ -1,0 +1,11 @@
+seed: 42
+device: cuda:0
+data:
+  manifest_path: data/interim/manifests/pfam_manifest.csv
+  sequence_column: sequence
+evaluation:
+  split: test                # which manifest split to evaluate on
+  top_k: [1, 5, 10, 50]      # report Recall@k / Top-k composition at these k
+  sample_queries: 2000       # subsample queries for speed; 0 = use full pool
+  encode_batch_size: 32      # batch size for the one-time corpus encoding
+  doc_chunk_size: 256        # ColBERT MaxSim chunk over docs (memory/speed tradeoff)

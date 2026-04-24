@@ -158,6 +158,28 @@ def main() -> None:
         persistent_workers=True,
         prefetch_factor=2,
     )
+    # Fast val loader: random subset for mid-epoch evals so they don't dominate wall time.
+    # Full val_loader is still used at epoch end.
+    eval_subsample = int(train_cfg["training"].get("eval_subsample_queries", 0))
+    if eval_subsample > 0 and eval_subsample < len(val_dataset):
+        rng_sub = torch.Generator().manual_seed(int(train_cfg["seed"]) + 99)
+        sub_indices = torch.randperm(len(val_dataset), generator=rng_sub)[:eval_subsample].tolist()
+        val_loader_fast = DataLoader(
+            torch.utils.data.Subset(val_dataset, sub_indices),
+            batch_size=int(train_cfg["training"]["batch_size"]),
+            shuffle=False,
+            num_workers=num_workers,
+            collate_fn=collator,
+            persistent_workers=True,
+            prefetch_factor=2,
+        )
+        if is_main:
+            LOGGER.info(
+                "Mid-epoch eval will use %d/%d val queries (full set used at epoch end)",
+                eval_subsample, len(val_dataset),
+            )
+    else:
+        val_loader_fast = val_loader
     gpu_ids = train_cfg["training"].get("gpu_ids")
     if not is_ddp and gpu_ids and len(gpu_ids) > 1 and hasattr(model, "backbone"):
         LOGGER.info("Wrapping backbone encoder in DataParallel across GPUs %s", gpu_ids)
@@ -211,9 +233,9 @@ def main() -> None:
     wall_start = time.time()
     last_log_time = wall_start
 
-    def _run_validation(epoch_1: int, epoch_step: int) -> None:
+    def _run_validation(epoch_1: int, epoch_step: int, loader: DataLoader) -> None:
         nonlocal best_mrr, patience_counter, stop_training
-        val_metrics = evaluate_model(model, val_loader, temperature=temperature)
+        val_metrics = evaluate_model(model, loader, temperature=temperature)
         if is_main:
             LOGGER.info(
                 "[val] epoch=%d step=%d val_loss=%.4f val_mrr=%.4f",
@@ -308,7 +330,7 @@ def main() -> None:
             if did_opt_step and eval_interval_steps > 0:
                 opt_steps = global_step // grad_accum_steps
                 if opt_steps % eval_interval_steps == 0:
-                    _run_validation(epoch_1, epoch_step)
+                    _run_validation(epoch_1, epoch_step, val_loader_fast)
                     if _should_stop(stop_training, is_ddp):
                         break
 
