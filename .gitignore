@@ -15,8 +15,6 @@ checkpoints/
 results/
 *.h5
 *.pt
-*.fa
-*.fa.fai
 *.gtf
 *.csv
 *.log
