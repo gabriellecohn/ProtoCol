@@ -1,0 +1,14 @@
+transformers==4.46.3
+tokenizers>=0.20
+huggingface_hub>=0.26
+datasketch
+
+torch
+numpy
+tqdm
+
+# NOTE: MMseqs2 is NOT a pip package. It is a system binary installed at
+# runtime by eval_mmseqs() / time_mmseqs() via:
+#     sudo apt-get install -y mmseqs2
+# or, if you prefer conda:
+#     conda install -c bioconda mmseqs2
