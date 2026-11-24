@@ -100,6 +100,10 @@ class PerceiverPooler(nn.Module):
             nn.init.xavier_uniform_(lin.weight)
             nn.init.zeros_(lin.bias)
 
+    def position_bias(self, attention_mask, V):
+        """Optional additive attention bias (B, V, L); subclasses override. None = plain FLINT."""
+        return None
+
     def forward(self, tokens, attention_mask, mode="doc"):
         B, L, _ = tokens.shape
         latents = self.query_latents if mode == "query" else self.doc_latents
@@ -114,6 +118,9 @@ class PerceiverPooler(nn.Module):
         Vv = self.v_proj(kv).view(B, L, H, hd).transpose(1, 2)
         # Boolean mask: True = attend. Padding residues are never attended.
         attn_mask = attention_mask.bool()[:, None, None, :]
+        bias = self.position_bias(attention_mask, V)
+        if bias is not None:  # additive (B, V, L) bias, shared across heads
+            attn_mask = bias[:, None].masked_fill(~attn_mask, float("-inf")).to(Q.dtype)
         out = F.scaled_dot_product_attention(
             Q, K, Vv, attn_mask=attn_mask,
             dropout_p=self.attn_dropout if self.training else 0.0)
